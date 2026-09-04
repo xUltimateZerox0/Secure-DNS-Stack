@@ -1,4 +1,4 @@
-# Secure-DNS-Stack (WIP)
+# Secure-DNS-Stack
 
 Bare metal DNS infrastructure featuring Pi-hole and Unbound, usable by any device through a Tailscale VPN, providing either recursive or DoT (DNS-over-TLS) resolution mode. State management is provided by a custom bash script.
 
@@ -21,7 +21,7 @@ Unlike standard Docker deployments, this stack is built directly on bare-metal t
                         |
 ========================|=========================================
  nftables Firewall      | (DROP outbound 53/UDP+TCP) 
-                        +-- ALLOW if meta skuid == 102 (unbound uid)
+                        +-- ALLOW if meta skuid == unbound uid (id -u unbound)
 ========================|=========================================
                         |
        +----------------+----------------+
@@ -156,7 +156,7 @@ The repository includes a deployment script (`install.sh`) that converges a Debi
 
 **What the script does:**
 1.  Preflight checks (root, systemd, OS family, free disk, port holders) with `--dry-run` available.
-2.  Installs core dependencies (`unbound`, `nftables`, `dns-root-data`, `bind9-dnsutils`, `ca-certificates`, `curl`, `sqlite3`, `iproute2`).
+2.  Installs core dependencies (`unbound`, `nftables`, `dns-root-data`, `bind9-dnsutils`, `ca-certificates`, `curl`, `sqlite3`, `iproute2`, `git`).
 3.  Disables `systemd-resolved`/`resolvconf` stubs when present and locks `/etc/resolv.conf` to `127.0.0.1`, shielded from NetworkManager.
 4.  Deploys the `nftables` leak-prevention ruleset without touching other tables, plus Unbound base tuned to installed RAM.
 5.  Installs Pi-hole with the official installer when missing (network identity detected, confirmed, never changed), then enforces upstream `127.0.0.1#5335`, HTTPS-only admin and blocklists on any install.

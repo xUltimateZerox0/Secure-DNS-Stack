@@ -297,7 +297,7 @@ phase_packages() {
     dig_pkg=$(first_available bind9-dnsutils dnsutils) \
         || { log "No dig package found."; return 1; }
     install_packages unbound dns-root-data nftables ca-certificates \
-        curl sqlite3 iproute2 "$dig_pkg"
+        curl sqlite3 iproute2 git "$dig_pkg"
     mem_profile
 }
 phase_resolver() {
