@@ -40,8 +40,7 @@ Admin HTTPS on port 443 follows the same interfaces.
 - Port 53 scope: drops apply to cleartext DNS, loopback stays
   allowed for Pi-hole to Unbound. Upstream TLS uses port 853
   and is defined in the Unbound config.
-- Boot default: By default, after boot the host enforces DOT mode
-  until the operator explicitly selects the recursive alternative. 
-  This is because cleartext recursion is considered less secure,
-  but it can be set as the persistent option with the unbound-manage
-  command `sudo unbound-manage recursive|dot --persistent`. 
+- Boot default: after boot the host enforces dot until
+  the operator selects recursive. A persistent choice can be saved with
+  `sudo unbound-manage recursive|dot --persistent` or
+  `sudo unbound-manage default recursive|dot`.

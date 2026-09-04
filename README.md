@@ -57,13 +57,15 @@ Manually editing DNS daemon configurations is complex, error-prone, and can lead
 *   **Firewall Synchronization:** When switching to `recursive` mode, the script dynamically injects the `skuid` exemption directly into the `nftables` ruleset, and securely removes it when switching back to `dot`.
 *   **Idempotency (Fast-Path):** Re-applying the current active mode is a fast-path no-op. The script detects the running state and leaves the daemon untouched, saving resources.
 *   **Fail-Forward Design:** If validation fails post-reload, the script intentionally avoids automatic rollbacks (which can cause looping failures) and instead prints the exact manual recovery commands alongside the retained configuration backup.
+*   **Persistent Default:** Boot default is dot. With `--persistent` the mode is saved to `/var/lib/unbound-manage/mode` and reapplied at boot by `unbound-manage-restore.service`.
 
 Runs ONLY on the Pi-hole + Unbound server (auto-guarded). Full reference: `unbound-manage --help`.
 
 | Command | Purpose | Time |
 |---|---|---|
-| `dot` | Switch Unbound to DoT forwarding → Quad9 only (removes non-Quad9 upstreams, DNSSEC stays on) | ~3-5s |
-| `recursive` | Switch to full recursion (root hints + anchor + qname minimisation, no forwarders) | ~3-5s |
+| `dot [--persistent]` | Switch Unbound to DoT forwarding → Quad9 only (removes non-Quad9 upstreams, DNSSEC stays on) | ~3-5s |
+| `recursive [--persistent]` | Switch to full recursion (root hints + anchor + qname minimisation, no forwarders) | ~3-5s |
+| `default [dot\|recursive\|clear\|show]` | Save boot default mode, like `--persistent` but without switching. | instant |
 | `status` | Full diagnostic (mode, services, Tailscale, listeners, connectivity, resolv.conf, upstream, resolution, blocking, DNSSEC, DoT activity, firewall) | ~5-8s |
 | `fix-resolv` | Point /etc/resolv.conf to 127.0.0.1 (Pi-hole) | ~1-2s |
 | `--debug` | First-or-last-argument flag showing every command + raw output | — |
