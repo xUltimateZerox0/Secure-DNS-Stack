@@ -1,0 +1,5 @@
+*.backup.*
+*.disabled.*
+gravity.db
+pihole-FTL.db
+pihole.toml

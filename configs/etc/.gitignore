@@ -1,5 +1,0 @@
-*.backup
-*.disabled
-gravity.db
-pwhash
-pihole-unbound-setup.sh
