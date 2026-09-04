@@ -152,12 +152,14 @@ The repository includes a deployment script (`install.sh`) that converges a Debi
 *   Raspberry Pi OS and Armbian (Debian-family, same package set)
 *   Other systems are not covered by my tests; `--allow-unsupported` lets you try anyway and report back
 
+**Remote access (optional, independent):** remote DNS over Tailscale needs a joined tailnet, configured separately with `sudo tailscale up`. Without it the stack serves the LAN only.
+
 **What the script does:**
 1.  Preflight checks (root, systemd, OS family, free disk, port holders) with `--dry-run` available.
 2.  Installs core dependencies (`unbound`, `nftables`, `dns-root-data`, `bind9-dnsutils`, `ca-certificates`, `curl`, `sqlite3`, `iproute2`).
 3.  Disables `systemd-resolved`/`resolvconf` stubs when present and locks `/etc/resolv.conf` to `127.0.0.1`, shielded from NetworkManager.
 4.  Deploys the `nftables` leak-prevention ruleset without touching other tables, plus Unbound base tuned to installed RAM.
-5.  Adopts an existing Pi-hole install: enforces upstream `127.0.0.1#5335`, HTTPS-only admin and blocklists. Pi-hole itself is installed beforehand with the official installer.
+5.  Installs Pi-hole with the official installer when missing (network identity detected, confirmed, never changed), then enforces upstream `127.0.0.1#5335`, HTTPS-only admin and blocklists on any install.
 6.  Installs `unbound-manage` in `/usr/local/bin` and enables the boot restore service, then adds UFW DNS allows only.
 7.  Verifies everything with `unbound-manage status`.
 
@@ -168,7 +170,7 @@ The repository includes a deployment script (`install.sh`) that converges a Debi
 git clone https://github.com/xUltimateZerox0/Secure-DNS-Stack.git
 cd Secure-DNS-Stack
 
-# 2. Review the installer (700 lines, root privileges: skim it, then trust but verify)
+# 2. Review the installer (root privileges needed, do not execute blindly)
 less install.sh
 
 # 3. Preview without changing anything
@@ -180,6 +182,12 @@ sudo ./install.sh
 # 5. Verify the deployment
 sudo unbound-manage status
 ```
+
+### After Install
+
+> **IMPORTANT**
+> *   Set the web password yourself with `pihole setpassword` — the installer never touches personal credentials/secrets.
+> *   On DHCP networks reserve a static address for the server on the router, otherwise clients pointing at it lose DNS when the lease changes.
 
 ## License
 

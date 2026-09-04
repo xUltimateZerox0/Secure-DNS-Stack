@@ -6,7 +6,8 @@
 # Order: preflight -> backup -> packages -> resolver lock -> nftables ->
 # unbound -> pihole (incl. managed keys) -> unbound-manage -> ufw -> verify.
 # Each phase verifies before the next starts. On failure the script stops
-# and prints restore paths, it never auto-rolls back a running DNS server.
+# and prints restore paths, it never auto-rolls back.
+
 set -uo pipefail
 
 VERSION="0.1.0"
@@ -75,7 +76,7 @@ parse_args() {
     if (( DRY_RUN )); then LOG="/tmp/secure-dns-install-dryrun.log"; fi
 }
 
-# --- Preflight: refuse to break the wrong machine ---
+# --- Preflight: don't break the wrong machine ---
 
 preflight() {
     log "Preflight checks"
@@ -128,6 +129,15 @@ preflight() {
     done
     (( missing )) && exit 1
 
+    # Tailnet is optional: without login the stack serves LAN only.
+    if command -v tailscale >/dev/null 2>&1; then
+        if ! tailscale status >/dev/null 2>&1; then
+            log "Tailscale not logged in: tailnet DNS stays unavailable, LAN still works."
+            log "Join later with: sudo tailscale up"
+        fi
+    else
+        log "No tailscale binary: LAN-only operation."
+    fi
     # Unknown listener on 53 means someone else owns DNS here.
     # My own daemons are fine and never prompt on re-runs.
     local holder unknown
@@ -259,7 +269,7 @@ first_available() {
     return 1
 }
 
-# --- Resource profile: RAM decides unbound cache, never assume a big server ---
+# --- Resource profile: RAM decides unbound cache to adapt to every machine. Even small servers are beautiful ---
 
 # Sets UNBOUND_THREADS/MSG_CACHE/RRSET_CACHE from MemTotal.
 # Covers 512MB boards up to servers; caps are limits, not preallocation.
@@ -327,7 +337,7 @@ phase_resolver() {
             return 1
         fi
     fi
-    # NetworkManager only: keep it from reclaiming resolv.conf later.
+    # NetworkManager only: keep it from reclaiming resolv.conf later. Personally, I hate NM.
     if [[ -d /etc/NetworkManager ]] || command -v NetworkManager >/dev/null 2>&1; then
         DEPLOY_CHANGED=0
         deploy_file configs/etc/NetworkManager/conf.d/90-dns-none.conf \
@@ -344,7 +354,7 @@ phase_resolver() {
 phase_nftables() {
     log "Phase nftables"
     # Never silently replace someone else's firewall: only tables outside
-    # only my "inet filter" table is mine: anything else counts as foreign (UFW/Tailscale live in RAM,
+    # only the "inet filter" table is mine: anything else counts as foreign (UFW/Tailscale live in RAM,
     # not in this file). Backup is kept in every case.
     if [[ -f /etc/nftables.conf ]] \
         && ! cmp -s "${SCRIPT_DIR}/configs/etc/nftables.conf" /etc/nftables.conf 2>/dev/null; then
@@ -490,18 +500,66 @@ phase_unbound() {
     [[ -n "$r" ]] || { log "unbound :5335 does not resolve."; return 1; }
     log "unbound :5335 resolves -> $r"
 }
+# Fresh Pi-hole via the official installer, network identity detected
+# from the live system and confirmed, never guessed or changed.
+install_pihole_fresh() {
+    local iface="" ip="" cidr=""
+    iface=$(ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    [[ -n "$iface" ]] || { log "Cannot detect the default interface."; return 1; }
+    ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)
+    cidr=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -sf2)
+    [[ -n "$ip" ]] || { log "No IPv4 on $iface, Pi-hole needs one."; return 1; }
+    log "Detected network identity: $ip/${cidr:-24} on $iface (left untouched)."
+    confirm_or_exit "Install Pi-hole with this identity?"
+    mutate mkdir -p /etc/pihole
+    if (( ! DRY_RUN )); then
+        cat > /etc/pihole/setupVars.conf << EOF
+# Preseeded by secure-dns-stack installer, official keys only.
+PIHOLE_INTERFACE=${iface}
+IPV4_ADDRESS=${ip}/${cidr:-24}
+QUERY_LOGGING=true
+INSTALL_WEB_SERVER=true
+INSTALL_WEB_INTERFACE=true
+BLOCKING_ENABLED=true
+DNSSEC=false
+EOF
+        chmod 644 /etc/pihole/setupVars.conf
+    else
+        log "DRY-RUN skip: preseed setupVars.conf and official installer."
+        return 0
+    fi
+    log "Running the official Pi-hole installer (unattended, may take minutes)."
+    local attempt=0
+    while (( attempt < 3 )); do
+        attempt=$((attempt + 1))
+        if curl -sSL https://install.pi-hole.net | timeout 1200 bash /dev/stdin --unattended; then
+            break
+        fi
+        command -v pihole-FTL >/dev/null 2>&1 && break
+        (( attempt < 3 )) || { log "Pi-hole installer failed 3 times."; return 1; }
+        log "Retrying installer in 10s ($attempt/3)..."
+        sleep 10
+    done
+    log "Pi-hole installed, adoption follows in this same phase."
+}
 phase_pihole() {
     log "Phase pihole"
-    # Adopt-only: an existing Pi-hole keeps its install, we enforce only
-# my three keys plus blocklists. Fresh installs stay manual for now:
-    # unattended setup needs static-IP decisions this script must not guess.
     local has_ftl=0 has_cli=0
     command -v pihole-FTL >/dev/null 2>&1 && has_ftl=1
     command -v pihole >/dev/null 2>&1 && has_cli=1
     if (( ! has_ftl && ! has_cli )); then
-        log "No Pi-hole found. Install it first (official installer),"
-        log "then re-run: this phase only adopts existing installs."
-        return 1
+        install_pihole_fresh || return 1
+        if (( DRY_RUN )); then
+            log "DRY-RUN: fresh Pi-hole assumed present, adoption preview ends here."
+            return 0
+        fi
+        command -v pihole-FTL >/dev/null 2>&1 && has_ftl=1
+        command -v pihole >/dev/null 2>&1 && has_cli=1
+        if (( ! has_ftl && ! has_cli )); then
+            log "Pi-hole installer finished without usable binaries."
+            return 1
+        fi
     fi
     if [[ -f /etc/pihole/pihole.toml ]]; then
         backup_path /etc/pihole/pihole.toml
@@ -538,7 +596,8 @@ phase_pihole() {
         done < "${SCRIPT_DIR}/configs/etc/pihole/adlists.txt"
         log "Refreshing gravity (downloads blocklists, may take minutes)."
         confirm_or_exit "Run pihole gravity update now?"
-        mutate pihole -g
+        # Bounded wait: on timeout the previous gravity DB stays in place.
+        mutate timeout 900 pihole -g || return 1
     fi
     if (( DRY_RUN )); then return 0; fi
     local r
