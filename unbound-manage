@@ -1,0 +1,1218 @@
+#!/bin/bash
+# unbound-manage - Unbound mode manager for the Pi-hole + Unbound server
+# Runs ONLY on the DNS server itself (Pi-hole v6 + Unbound on 127.0.0.1:<port>).
+#
+# Usage:
+#   unbound-manage status      - Full diagnostic: connectivity, Tailscale, mode,
+#                                DNS resolution, ad/malware blocking, DNSSEC,
+#                                DoT activity, DNS-leak firewall, resolv.conf.
+#   unbound-manage dot [--persistent] - Switch Unbound to DoT forwarding -> Quad9 ONLY
+#                                (9.9.9.9 + 149.112.112.112 via TLS/853).
+#                                Any non-Quad9 upstream (e.g. Cloudflare) is removed.
+#   unbound-manage recursive [--persistent] - Switch Unbound to full recursion (root hints,
+#                                DNSSEC root anchor, qname minimisation).
+#   unbound-manage default [dot|recursive|clear|show] - Saved boot default without switching.
+#   unbound-manage fix-resolv  - Point /etc/resolv.conf to 127.0.0.1 (Pi-hole).
+#   unbound-manage help        - This help.
+#
+# Downtime is minimized: the new config is validated with unbound-checkconf,
+# applied atomically, and activated via unbound-control reload (fallback:
+# systemctl restart unbound). On verification failure the new mode stays
+# active and the exact manual restore commands are printed (no auto-rollback).
+set -uo pipefail
+
+# ─── Signal handling ──────────────────────────────────────────────────────────
+SCRIPT_START=0
+# Delete the temp config on exit, signals included.
+cleanup_trap() {
+    trap '' INT TERM EXIT
+    rm -f "${TMP_CONF:-}" 2>/dev/null || true
+}
+trap cleanup_trap EXIT
+trap 'exit 2' INT
+trap 'exit 15' TERM
+
+# --- Paths and upstreams, fixed for this server.
+readonly CONF_DIR="/etc/unbound/unbound.conf.d"
+readonly CONF_FILE="${CONF_DIR}/unbound-manage.conf"
+readonly MAIN_CONF="/etc/unbound/unbound.conf"
+readonly RESOLV_CONF="/etc/resolv.conf"
+readonly UNBOUND_CTL="unbound-control"
+readonly UNBOUND_CHECKCONF_BIN="unbound-checkconf"
+readonly QUAD9_PRIMARY="9.9.9.9"
+readonly QUAD9_SECONDARY="149.112.112.112"
+readonly QUAD9_DOT_AUTH="dns.quad9.net"
+readonly QUAD9_IPS="9.9.9.9 149.112.112.112 2620:fe::9 2620:fe::fe"
+readonly DEFAULT_PORT="5335"
+readonly PIHOLE_PORT="53"
+# Saved default mode for boot restore, written only with --persistent.
+readonly STATE_DIR="/var/lib/unbound-manage"
+readonly STATE_FILE="${STATE_DIR}/mode"
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly GRAY='\033[2m'
+readonly NC='\033[0m'
+
+# --debug: every external command is echoed and its output shown, instead of
+# being silenced (>/dev/null, 2>/dev/null) like in normal runs.
+DBG=0
+
+ok()    { echo -e " ${GREEN}✔${NC} $1"; }
+warn()  { echo -e " ${YELLOW}⚠${NC} $1"; }
+fail()  { echo -e " ${RED}✘${NC} $1"; }
+info()  { echo -e " ${CYAN}→${NC} $1"; }
+header(){ echo -e "\n${BOLD}━━━ $1 ━━━${NC}"; }
+dbg()   { (( DBG )) && echo -e " ${CYAN}→${NC} $1" >&2; }
+
+# Run a command: fully quiet by default, echo + show everything with --debug.
+run_q() {
+    if (( DBG )); then
+        echo -e "${GRAY}  \$ $*${NC}" >&2
+        "$@" 2>&1
+    else
+        "$@" >/dev/null 2>&1
+    fi
+}
+
+# Run a command capturing stdout; stderr silenced normally, merged+shown in debug.
+run_c() {
+    if (( DBG )); then
+        echo -e "${GRAY}  \$ $*${NC}" >&2
+        "$@" 2>&1
+    else
+        "$@" 2>/dev/null
+    fi
+}
+
+# Start the millisecond timer for reload reporting.
+init_timing() { SCRIPT_START=$(date +%s%N); }
+elapsed() {
+    local now
+    now=$(date +%s%N)
+    echo $(( (now - SCRIPT_START) / 1000000 ))
+}
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# systemctl wrapper, fails if systemd action fails.
+sys_action() {
+    local action="$1" unit="$2"
+    run_q systemctl "$action" "$unit"
+}
+
+is_active()  { sys_action is-active "$1"; }
+is_enabled() { sys_action is-enabled "$1"; }
+
+# unbound-control wrapper: 0 only if the daemon answers on the control socket.
+ub_control() {
+    if has_cmd "$UNBOUND_CTL" && run_q "$UNBOUND_CTL" status; then
+        run_q "$UNBOUND_CTL" "$@"
+        return $?
+    fi
+    return 1
+}
+
+# Options as actually declared in the raw config files (not defaults).
+raw_declared() {
+    local opt="$1"
+    grep -hE "^[[:space:]]*${opt}:" "$CONF_DIR"/*.conf 2>/dev/null \
+        | sed -E "s/^[[:space:]]*${opt}:[[:space:]]*//" \
+        | grep -v '^#' || true
+}
+
+# Options declared in OTHER files (excluding the managed one).
+# They survive a mode switch and must not be redeclared in our file.
+other_declared() {
+    local opt="$1" f
+    for f in "$CONF_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "$CONF_FILE" ]] && continue
+        grep -hE "^[[:space:]]*${opt}:" "$f" 2>/dev/null \
+            | sed -E "s/^[[:space:]]*${opt}:[[:space:]]*//" \
+            | grep -v '^#'
+    done
+}
+
+# Unbound port from config files, fallback to default.
+effective_port() {
+    local p
+    p=$(raw_declared port | head -1)
+    [[ "$p" =~ ^[0-9]+$ ]] || p="$DEFAULT_PORT"
+    echo "$p"
+}
+
+# IPv6 upstream flag from config, default no without v6 route.
+effective_doip6() {
+    local v
+    v=$(raw_declared do-ip6 | head -1)
+    [[ "$v" =~ ^(yes|no)$ ]] || v="no"
+    echo "$v"
+}
+
+# Tailscale IPv4 of THIS machine, auto-detected.
+detect_ts_ip() {
+    if has_cmd tailscale; then
+        local ip
+        ip=$(run_c tailscale ip -4 | head -1) || true
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+        ip=$(run_c tailscale status | head -1 | awk '{print $1}') || true
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    fi
+    return 1
+}
+
+# DNSSEC root anchor file, Debian-first, cross-distro fallbacks.
+find_root_anchor() {
+    local f
+    for f in /var/lib/unbound/root.key /usr/share/dns/root.key \
+             /etc/unbound/root.key /usr/share/dnssec-root/root.key; do
+        [[ -s "$f" ]] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+
+# Root hints file; empty result = unbound builtin hints (acceptable fallback).
+find_root_hints() {
+    local f
+    for f in /usr/share/dns/root.hints /usr/share/dnssec-root/root.hints \
+             /etc/unbound/root.hints /var/lib/unbound/root.hints; do
+        [[ -s "$f" ]] && { echo "$f"; return 0; }
+    done
+    return 1
+}
+
+# Wait until unbound answers on its port, any reply proves it serves.
+wait_for_unbound() {
+    local port="$1" q tries n
+    tries=25
+    for n in $(seq 1 "$tries"); do
+        q=$(run_c dig "@127.0.0.1" -p "$port" +noall +comments +timeout=3 +tries=2 \
+            "w-$(date +%s%N).google.com")
+        if grep -q 'status:' <<< "$q"; then
+            dbg "probe $n: answering"
+            return 0
+        fi
+        dbg "probe $n: ${q:-no response}"
+        sleep 1
+    done
+    return 1
+}
+
+# Bring unbound up, reload first then full restart if stalled.
+ensure_unbound_up() {
+    local port="$1"
+    wait_for_unbound "$port" && return 0
+    warn "unbound slow to respond after reload - forcing full restart"
+    sys_action restart unbound
+    wait_for_unbound "$port" && return 0
+    warn "unbound still slow - restarting again (second attempt)"
+    sys_action restart unbound
+    wait_for_unbound "$port"
+}
+
+# DNS-leak firewall: recursive needs cleartext 53, dot needs 853 only.
+# Exemption for unbound is added before drops in recursive, removed in dot.
+
+LEAK_SPECS=""   # "fam table chain" per ogni chain output-hook con dport-53 drop
+LEAK_FAM=""     # famiglia della prima spec (inet se presente: copre v4+v6)
+LEAK_TABLE=""
+LEAK_CHAIN=""
+LEAK_UID=""         # numeric uid of the unbound daemon
+
+nft_available() { has_cmd nft; }
+
+# Numeric UID of the unbound user for the nft exemption.
+unbound_uid() {
+    if [[ -n "$LEAK_UID" ]]; then echo "$LEAK_UID"; return 0; fi
+    local u
+    u=$(id -u unbound 2>/dev/null)
+    [[ "$u" =~ ^[0-9]+$ ]] || u=$(awk -F: '/^unbound:/{print $3; exit}' /etc/passwd)
+    if [[ ! "$u" =~ ^[0-9]+$ ]] || [[ "$u" -le 0 ]]; then
+        LEAK_UID=""
+        return 1
+    fi
+    LEAK_UID="$u"
+    echo "$u"
+}
+
+# Find output chains that drop port 53, sorted inet first.
+find_leak_chain() {
+    [[ -n "$LEAK_SPECS" ]] && return 0
+    nft_available || return 1
+    LEAK_SPECS=$(run_c nft list ruleset | awk '
+        /^table (ip|ip6|inet)[[:space:]]/ {fam=$2; tbl=$3; sub(/\{.*/,"",tbl); inhook=0; next}
+        /^[[:space:]]*chain / {chn=$2; sub(/\{.*/,"",chn); inhook=0; next}
+        /^[[:space:]]*type filter hook output/ {inhook=1; next}
+        inhook && /dport 53/ && /drop/ {print fam, tbl, chn}
+    ' | sort -u)
+    [[ -n "$LEAK_SPECS" ]] || return 1
+    LEAK_FAM=$(awk 'NR==1{print $1}' <<< "$LEAK_SPECS")
+    LEAK_TABLE=$(awk 'NR==1{print $2}' <<< "$LEAK_SPECS")
+    LEAK_CHAIN=$(awk 'NR==1{print $3}' <<< "$LEAK_SPECS")
+    dbg "DNS-leak firewall: ${LEAK_SPECS//$'\n'/ ; }"
+    return 0
+}
+
+# Handles of our unbound exemption rules for deletion.
+leak_exemption_handles() {
+    find_leak_chain || return 1
+    nft_available || return 1
+    run_c nft -a list ruleset | awk -v specs="$LEAK_SPECS" -v u="$LEAK_UID" '
+        BEGIN {
+            n = split(specs, L, "\n")
+            for (i = 1; i <= n; i++) { split(L[i], w, " "); key[w[1] FS w[2] FS w[3]] = 1 }
+        }
+        /^table (ip|ip6|inet)[[:space:]]/ {fam=$2; tbl=$3; sub(/\{.*/,"",tbl); next}
+        /^[[:space:]]*chain / {chn=$2; sub(/\{.*/,"",chn); inch = (key[fam FS tbl FS chn] == 1); next}
+        inch && ($0 ~ "skuid " u) && /dport 53/ && /accept/ && /# handle/ {
+            sub(/.*# handle[[:space:]]*/, ""); print fam, tbl, chn, $0
+        }
+    '
+}
+
+# True when the unbound exemption already exists in nftables.
+leak_exemption_present() {
+    [[ -n "$(leak_exemption_handles)" ]]
+}
+
+# Add unbound exemption in every leak chain, skip if present.
+leak_add_exemption() {
+    local u out
+    u=$(unbound_uid) || {
+        warn "cannot determine unbound uid - leaving DNS-leak firewall untouched"
+        return 1
+    }
+    find_leak_chain || { info "no DNS-leak firewall (nft dport-53 drop) detected"; return 0; }
+    if leak_exemption_present; then
+        ok "DNS-leak firewall: exemption for unbound (uid $u) already present"
+        return 0
+    fi
+    local fam tbl chn proto rc=0
+    while read -r fam tbl chn; do
+        for proto in udp tcp; do
+            if out=$(run_c nft insert rule "$fam" "$tbl" "$chn" meta skuid "$u" "$proto" dport 53 accept); then
+                ok "DNS-leak firewall: outbound-53 exemption added for unbound (uid $u, $fam/$chn $proto)"
+            else
+                fail "DNS-leak firewall: could not insert the $proto exemption in $fam/$tbl/$chn (nft error)"
+                [[ -n "$out" ]] && info "nft: $(echo "$out" | head -3)"
+                info "Manual: sudo nft insert rule $fam $tbl $chn meta skuid $u $proto dport 53 accept"
+                rc=1
+            fi
+        done
+    done <<< "$LEAK_SPECS"
+    return $rc
+}
+
+# Remove unbound exemption rules by handle, highest first.
+leak_remove_exemption() {
+    local u hs tries=0 fam tbl chn h
+    u=$(unbound_uid) || return 1
+    while :; do
+        hs=$(leak_exemption_handles | sort -k4 -rn)
+        [[ -n "$hs" ]] || break
+        tries=$((tries + 1))
+        if [[ $tries -gt 5 ]]; then
+            warn "DNS-leak firewall: still $(wc -l <<< "$hs") exemption rule(s) after 5 passes"
+            break
+        fi
+        while read -r fam tbl chn h; do
+            if run_q nft delete rule "$fam" "$tbl" "$chn" handle "$h"; then
+                ok "DNS-leak firewall: exemption rule removed (handle $h in $fam/$chn)"
+            else
+                warn "DNS-leak firewall: could not remove rule handle $h in $fam/$chn"
+            fi
+        done <<< "$hs"
+    done
+}
+
+# Detect current mode from config files, sets MODE and UPSTREAMS.
+detect_mode() {
+    MODE="unknown"; MODE_FILE=""; UPSTREAMS=""
+
+    # Source of truth: our managed file if present, else any file with a
+    # root (".") forward zone, else recursion.
+    local f
+    if [[ -f "$CONF_FILE" ]]; then
+        MODE_FILE="$CONF_FILE"
+    else
+        for f in "$CONF_DIR"/*.conf; do
+            [[ -f "$f" ]] || continue
+            if grep -q 'forward-zone:' "$f" 2>/dev/null && \
+               grep -q 'name: "\.' "$f" 2>/dev/null; then
+                MODE_FILE="$f"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$MODE_FILE" ]]; then
+        # Extract the "." forward-zone block (until next top-level clause).
+        local block
+        block=$(awk '
+            /^[[:space:]]*forward-zone:[[:space:]]*$/ {inzone=1; print; next}
+            /^[[:space:]]*(server|stub-zone|auth-zone|remote-control|python|dynlib|dnstap|view|include|include-toplevel):/ {if (inzone) exit}
+            inzone {print}
+        ' "$MODE_FILE" 2>/dev/null)
+        if grep -q 'forward-zone:' <<< "$block" 2>/dev/null; then
+            if grep -q 'forward-tls-upstream:[[:space:]]*yes' <<< "$block" 2>/dev/null; then
+                MODE="dot"
+            else
+                MODE="plain-forward"
+            fi
+            UPSTREAMS=$(grep 'forward-addr:' <<< "$block" 2>/dev/null \
+                        | sed -E 's/^[[:space:]]*forward-addr:[[:space:]]*//' \
+                        | tr '\n' ' ')
+        else
+            MODE="recursive"
+        fi
+    else
+        MODE="recursive"
+    fi
+}
+
+# Is a raw forward-addr (ip@port#name) a Quad9 endpoint?
+is_quad9_addr() {
+    local raw="$1" ip
+    ip=$(sed -E 's/@[^#]*#?.*//; s/@.*//' <<< "$raw" | tr -d ' ')
+    ip=$(sed 's/^\[//; s/\]$//' <<< "$ip")
+    local q
+    for q in $QUAD9_IPS; do
+        [[ "$ip" == "$q" ]] && return 0
+    done
+    return 1
+}
+
+# Render a full mode config file, skip options owned by other files.
+render_config() {
+    local mode="$1" out_file="$2"
+    local port doip6 config=""
+
+    # Port and interfaces come from other files when declared there.
+    local declared_port declared_ifaces declared_doip6 declared_anchor declared_reuseport
+    declared_port=$(other_declared port | head -1)
+    declared_ifaces=$(other_declared interface | sort -u)
+    declared_doip6=$(other_declared do-ip6 | head -1)
+    declared_anchor=$(other_declared auto-trust-anchor-file | head -1)
+    declared_reuseport=$(other_declared so-reuseport | head -1)
+
+    port=$(effective_port)
+    doip6=$(effective_doip6)
+
+    config+="# Managed by unbound-manage - mode=${mode} - $(date '+%Y-%m-%d %H:%M:%S')\n"
+    config+="server:\n"
+    if [[ -z "$declared_ifaces" ]]; then
+        config+="    interface: 127.0.0.1\n"
+    fi
+    if [[ -z "$declared_port" ]]; then
+        config+="    port: $port\n"
+    fi
+    config+="    do-ip4: yes\n"
+    if [[ -z "$declared_doip6" ]]; then
+        config+="    do-ip6: $doip6\n"
+    fi
+    config+="    do-udp: yes\n"
+    config+="    do-tcp: yes\n"
+    config+="    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt\n"
+    if [[ -z "$declared_reuseport" ]]; then
+        # Single socket avoids stale reuseport sockets after reload.
+        config+="    so-reuseport: no\n"
+    fi
+    config+="\n"
+    config+="    # Performance\n"
+    config+="    prefetch: yes\n"
+    config+="    prefetch-key: yes\n"
+    config+="    num-threads: 2\n"
+    config+="    msg-cache-size: 128m\n"
+    config+="    rrset-cache-size: 256m\n"
+    config+="    cache-min-ttl: 3600\n"
+    config+="    cache-max-ttl: 86400\n"
+    config+="    so-rcvbuf: 1m\n"
+    config+="\n"
+    config+="    # Privacy & DNSSEC hardening\n"
+    config+="    hide-identity: yes\n"
+    config+="    hide-version: yes\n"
+    config+="    harden-glue: yes\n"
+    config+="    harden-dnssec-stripped: yes\n"
+    config+="    harden-below-nxdomain: yes\n"
+    config+="    harden-referral-path: yes\n"
+    config+="    do-not-query-localhost: no\n"
+    config+="    qname-minimisation: yes\n"
+    config+="    aggressive-nsec: yes\n"
+    config+="    deny-any: yes\n"
+
+    if [[ "$mode" == "recursive" ]]; then
+        config+="    qname-minimisation-strict: no\n"
+        config+="\n"
+        config+="    # Recursion roots\n"
+        local rh ra
+        if rh=$(find_root_hints); then
+            config+="    root-hints: $rh\n"
+        else
+            warn "No root.hints file found - using unbound builtin hints"
+        fi
+        if ra=$(find_root_anchor); then
+            if [[ -z "$declared_anchor" ]]; then
+                config+="    auto-trust-anchor-file: $ra\n"
+            fi
+        else
+            warn "No DNSSEC root anchor found - install dns-root-data or run unbound-anchor"
+        fi
+    else
+        config+="\n"
+        config+="    # DNSSEC validation of forwarded answers (unbound validates itself)\n"
+        local ra
+        if ra=$(find_root_anchor); then
+            if [[ -z "$declared_anchor" ]]; then
+                config+="    auto-trust-anchor-file: $ra\n"
+            fi
+        else
+            warn "No DNSSEC root anchor found - DNSSEC validation will not be active"
+        fi
+    fi
+
+    if [[ "$mode" == "dot" ]]; then
+        config+="\n"
+        config+="forward-zone:\n"
+        config+="    name: \".\"\n"
+        config+="    forward-tls-upstream: yes\n"
+        config+="    forward-addr: ${QUAD9_PRIMARY}@853#${QUAD9_DOT_AUTH}\n"
+        config+="    forward-addr: ${QUAD9_SECONDARY}@853#${QUAD9_DOT_AUTH}\n"
+    fi
+
+    printf '%b' "$config" > "$out_file"
+    chmod 644 "$out_file" 2>/dev/null || true
+}
+
+# Find other files with a root forward zone that would conflict.
+find_conflicting_files() {
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        [[ "$f" == "$CONF_FILE" ]] && continue
+        if grep -q 'forward-zone:' "$f" 2>/dev/null && \
+           grep -q 'name: "\.' "$f" 2>/dev/null; then
+            echo "$f"
+        fi
+    done
+}
+
+# Reload with control channel, restart as fallback.
+reload_unbound() {
+    if ub_control reload >/dev/null 2>&1; then
+        return 0
+    fi
+if sys_action reload unbound; then
+        return 0
+    fi
+    sys_action restart unbound
+}
+
+# Verify the new mode with fresh DNSSEC and resolution checks.
+verify_mode() {
+    local expected="$1" port
+    port=$(effective_port)
+
+    if wait_for_unbound "$port"; then
+        ok "unbound :$port responding"
+    elif ensure_unbound_up "$port"; then
+        ok "unbound :$port responding after restart"
+    else
+        fail "unbound not answering on 127.0.0.1:$port"
+        if [[ "$expected" == "recursive" ]]; then
+            warn "Hint: check the DNS-leak firewall (nftables dport 53) -"
+            warn "      'unbound-manage status' reports its state"
+        fi
+        return 1
+    fi
+
+    # DNSSEC: broken-signed zone must be SERVFAIL; good zone NOERROR.
+    local bad good
+    bad=$(run_c dig "@127.0.0.1" -p "$port" +timeout=6 +tries=1 dnssec-failed.org \
+          +noall +comments | grep -o 'status: [A-Z]*' | head -1)
+    if [[ "$bad" == "status: SERVFAIL" ]]; then
+        ok "DNSSEC: dnssec-failed.org → SERVFAIL (validation active)"
+    else
+        fail "DNSSEC: dnssec-failed.org → ${bad:-no response} (expected SERVFAIL)"
+        return 1
+    fi
+    good=$(run_c dig "@127.0.0.1" -p "$port" +timeout=6 +tries=1 www.ietf.org \
+           +noall +comments | grep -o 'status: [A-Z]*' | head -1)
+    if [[ "$good" == "status: NOERROR" ]]; then
+        ok "DNSSEC: www.ietf.org → NOERROR"
+    else
+        fail "DNSSEC: www.ietf.org → ${good:-no response} (expected NOERROR)"
+        return 1
+    fi
+
+    # Mode-specific evidence
+    if [[ "$expected" == "dot" ]]; then
+        local qp qs
+        qp="${QUAD9_PRIMARY//./\\.}"
+        qs="${QUAD9_SECONDARY//./\\.}"
+        local tls
+        tls=$(run_c ss -tnH state established '( dport = :853 )' \
+              | grep -cE "$qp|$qs" || true)
+        if [[ "${tls:-0}" -ge 1 ]]; then
+            ok "DoT: $tls live TLS connection(s) to Quad9:853"
+        else
+            info "DoT: no live TLS connection to Quad9:853 right now (expected when idle)"
+        fi
+        local fwd
+        fwd=$(grep '^[[:space:]]*forward-addr:' "$CONF_FILE" 2>/dev/null \
+              | sed -E 's/^[[:space:]]*forward-addr:[[:space:]]*//' | tr '\n' ' ')
+        if echo "$fwd" | grep -qE '@853#'; then
+            ok "forward-addr: $fwd"
+        else
+            fail "forward-addr not configured for DoT"
+            return 1
+        fi
+    else
+        local fl
+        fl=$(run_c ub_control list_forwards | grep -cE '^\.[[:space:]]+IN[[:space:]]+forward' || true)
+        if [[ "$fl" -eq 0 ]]; then
+            ok "recursion: no forward zone active"
+        else
+            fail "recursion: forward zone still active"
+            return 1
+        fi
+        local rh
+        if rh=$(find_root_hints); then
+            ok "root-hints: $rh"
+        else
+            warn "root-hints: builtin (no hints file found)"
+        fi
+        # Outbound UDP from unbound's port = real iterative traffic
+        local udp
+        udp=$(run_c ss -unHn sport = :"$port" | grep -cE ':[0-9]+\s+.*:53' || true)
+        if [[ "${udp:-0}" -ge 1 ]]; then
+            ok "recursion: $udp iterative UDP query(ies) observed from :$port"
+        else
+            info "recursion: no iterative UDP query observed (queries may have completed already)"
+        fi
+    fi
+
+    # Pi-hole still serving (blocking + resolution)
+    local ph bl
+    ph=$(run_c dig "@127.0.0.1" -p "$PIHOLE_PORT" +short +timeout=3 +tries=1 google.com | grep -E '^[0-9.]+$' | head -1)
+    if [[ -n "$ph" ]]; then
+        ok "pihole :$PIHOLE_PORT resolves → $ph"
+    else
+        warn "pihole :$PIHOLE_PORT did not answer google.com"
+    fi
+    bl=$(run_c dig "@127.0.0.1" -p "$PIHOLE_PORT" +short +timeout=3 +tries=1 doubleclick.net | grep -E '^(0\.0\.0\.0|127\.|::)' | head -1)
+    if [[ "$bl" == "0.0.0.0" ]] || [[ "$bl" =~ ^127\.0\.0\. ]] || [[ "$bl" == "::" ]]; then
+        ok "blocking: doubleclick.net → $bl (blocked)"
+    else
+        warn "blocking: doubleclick.net → ${bl:-no response} (not blocked?)"
+    fi
+    return 0
+}
+
+# Print manual restore commands, never rollback automatically.
+manual_restore_hint() {
+    local prev_mode="$1" backup="$2" pair dst orig
+    shift 2
+    warn "No automatic rollback: the new configuration stays in place."
+    info "To restore the previous state manually:"
+    if [[ -n "$backup" ]] && [[ -f "$backup" ]]; then
+        info "  sudo cp -a $(basename "$backup") $CONF_FILE"
+    else
+        info "  sudo rm -f $CONF_FILE"
+    fi
+    for pair in "$@"; do
+        dst="${pair%%:*}"; orig="${pair#*:}"
+        [[ -f "$dst" ]] || continue
+        info "  sudo mv $dst $orig   # re-enable $(basename "$orig")"
+    done
+    info "  sudo unbound-manage $prev_mode   # re-applies config + firewall state"
+}
+
+# Switch mode with validate, apply, firewall sync, verify.
+apply_mode() {
+    local target="$1"
+    init_timing
+    header "Switching Unbound to ${target^^}"
+
+    detect_mode
+    info "Current mode: ${MODE}${MODE_FILE:+ (${MODE_FILE})}"
+    [[ -n "$UPSTREAMS" ]] && info "Current upstreams:${UPSTREAMS}"
+
+    # Same mode already active, only reconcile the firewall.
+    if [[ "$target" == "$MODE" ]] && [[ "$MODE_FILE" == "$CONF_FILE" ]]; then
+        ok "${BOLD}$(basename "$CONF_FILE") already defines ${target^^} mode${NC} - nothing to do"
+        if [[ "$target" == "recursive" ]]; then
+            leak_add_exemption || true
+        else
+            leak_remove_exemption
+        fi
+        info "unbound left untouched (no reload, no restart)"
+        return 0
+    fi
+
+    # 1. Render + validate
+    local tmp
+    tmp=$(mktemp "${CONF_DIR}/.unbound-manage.XXXXXX")
+    TMP_CONF="$tmp"
+    render_config "$target" "$tmp" || { fail "config rendering failed"; return 1; }
+
+    if ! run_q "$UNBOUND_CHECKCONF_BIN" "$tmp"; then
+        fail "unbound-checkconf rejected the new configuration"
+        "$UNBOUND_CHECKCONF_BIN" "$tmp" 2>&1 | head -5
+        return 1
+    fi
+    ok "unbound-checkconf: config valid"
+
+    # 2. Backup current managed config (keep last 3)
+    local backup=""
+    if [[ -f "$CONF_FILE" ]]; then
+        backup="${CONF_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$CONF_FILE" "$backup"
+        ok "backup: $(basename "$CONF_FILE") → $(basename "$backup")"
+        find "$CONF_DIR" -maxdepth 1 -name 'unbound-manage.conf.backup.*' \
+             -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +4 \
+             | cut -d' ' -f2- | xargs -r rm -f
+    fi
+
+    # 3. Neutralize conflicting root forward zones in other files
+    local disabled_pairs=() f dst
+    for f in $(find_conflicting_files); do
+        dst="${f}.disabled.unbound-manage.$(date +%Y%m%d-%H%M%S%N)"
+        mv "$f" "$dst" 2>/dev/null || { fail "could not disable conflicting file $f"; return 1; }
+        disabled_pairs+=("$dst:$f")
+        warn "disabled conflicting zone file: $(basename "$f")"
+    done
+
+    # 4. Apply atomically and activate
+    if ! mv "$tmp" "$CONF_FILE" 2>/dev/null; then
+        fail "could not write $CONF_FILE"
+        return 1
+    fi
+    TMP_CONF=""
+    ok "config written: $CONF_FILE"
+
+    # Full config check before touching the daemon.
+    if ! run_q "$UNBOUND_CHECKCONF_BIN" "$MAIN_CONF"; then
+        fail "unbound-checkconf rejected the full configuration:"
+        "$UNBOUND_CHECKCONF_BIN" "$MAIN_CONF" 2>&1 | head -5
+        warn "unbound was NOT reloaded - it still serves the previous config in memory."
+        warn "NOTE: on the next reload/restart/reboot the invalid config would break it:"
+        manual_restore_hint "$MODE" "$backup" "${disabled_pairs[@]}"
+        return 1
+    fi
+    ok "unbound-checkconf: full config valid"
+
+    # Firewall follows the target mode.
+    if [[ "$target" == "recursive" ]]; then
+        leak_add_exemption || true
+    else
+        leak_remove_exemption
+    fi
+
+    if ! reload_unbound; then
+        fail "unbound did not reload/restart"
+        manual_restore_hint "$MODE" "$backup" "${disabled_pairs[@]}"
+        return 1
+    fi
+    ok "unbound reloaded ($(elapsed)ms)"
+
+    # 5. Verify; on failure the new mode stays active - print restore hints
+    if verify_mode "$target"; then
+        ok "${BOLD}${target^^} mode active${NC} ($(elapsed)ms)"
+        return 0
+    fi
+    fail "verification failed - new config is still active"
+    manual_restore_hint "$MODE" "$backup" "${disabled_pairs[@]}"
+    return 1
+}
+
+cmd_dot() {
+    local persistent=0
+    if [[ $# -gt 1 ]]; then fail "Too many arguments"; return 1; fi
+    [[ "${1:-}" == "--persistent" || "${1:-}" == "persistent" ]] && persistent=1
+    [[ -n "${1:-}" && "$persistent" -eq 0 ]] && { fail "Unknown argument: $1"; return 1; }
+    apply_mode "dot" || return $?
+    if (( persistent )); then
+        save_default_mode "dot" || return $?
+    fi
+}
+cmd_recursive() {
+    local persistent=0
+    if [[ $# -gt 1 ]]; then fail "Too many arguments"; return 1; fi
+    [[ "${1:-}" == "--persistent" || "${1:-}" == "persistent" ]] && persistent=1
+    [[ -n "${1:-}" && "$persistent" -eq 0 ]] && { fail "Unknown argument: $1"; return 1; }
+    apply_mode "recursive" || return $?
+    if (( persistent )); then
+        save_default_mode "recursive" || return $?
+    fi
+}
+
+# Saved default survives reboot, anything else stays DOT base after boot.
+save_default_mode() {
+    local mode="$1"
+    mkdir -p "$STATE_DIR" 2>/dev/null || { fail "cannot create $STATE_DIR"; return 1; }
+    echo "$mode" > "${STATE_FILE}.tmp" 2>/dev/null || { fail "cannot write $STATE_FILE"; return 1; }
+    mv "${STATE_FILE}.tmp" "$STATE_FILE" 2>/dev/null || { fail "cannot write $STATE_FILE"; return 1; }
+    chmod 644 "$STATE_FILE" 2>/dev/null || true
+    ok "default mode saved: $mode (restored at boot)"
+}
+
+# Manage the saved default without switching: show, set or clear.
+cmd_default() {
+    local arg="${1:-}"
+    if [[ $# -gt 1 ]]; then fail "Too many arguments"; return 1; fi
+    if [[ -z "$arg" || "$arg" == "show" ]]; then
+        if [[ -f "$STATE_FILE" ]]; then
+            local saved
+            saved=$(cat "$STATE_FILE" 2>/dev/null)
+            if [[ "$saved" == "dot" || "$saved" == "recursive" ]]; then
+                info "default mode: $saved"
+            else
+                warn "default file holds unexpected value: ${saved:-empty}"
+            fi
+        else
+            info "default mode: dot (base file, nothing saved)"
+        fi
+        return 0
+    fi
+    if [[ "$arg" == "clear" ]]; then
+        [[ "$(id -u)" -eq 0 ]] || { fail "Clearing the default requires root"; return 1; }
+        rm -f "$STATE_FILE" 2>/dev/null || { fail "cannot clear $STATE_FILE"; return 1; }
+        ok "default cleared, boot stays on dot base"
+        return 0
+    fi
+    if [[ "$arg" == "dot" || "$arg" == "recursive" ]]; then
+        [[ "$(id -u)" -eq 0 ]] || { fail "Saving the default requires root"; return 1; }
+        save_default_mode "$arg"
+        return $?
+    fi
+    fail "Usage: unbound-manage default [dot|recursive|clear|show]"
+    return 1
+}
+
+# Point resolv.conf to local Pi-hole.
+cmd_fix_resolv() {
+    init_timing
+    header "Fixing /etc/resolv.conf → 127.0.0.1"
+
+    local ns
+    ns=$(grep -m1 '^nameserver' "$RESOLV_CONF" 2>/dev/null | awk '{print $2}')
+    if [[ "$ns" == "127.0.0.1" ]]; then
+        ok "already correct (nameserver 127.0.0.1)"
+        return 0
+    fi
+
+    local backup
+    backup="${RESOLV_CONF}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$RESOLV_CONF" "$backup" 2>/dev/null || true
+    chattr -i "$RESOLV_CONF" >/dev/null 2>&1 || true
+    if [[ -L "$RESOLV_CONF" ]]; then rm -f "$RESOLV_CONF"; fi
+
+    cat > "$RESOLV_CONF" << EOF
+# Managed by unbound-manage - $(date '+%Y-%m-%d %H:%M:%S')
+nameserver 127.0.0.1
+options edns0
+EOF
+    chmod 644 "$RESOLV_CONF"
+    ok "resolv.conf → 127.0.0.1 (backup: $(basename "$backup"))"
+
+    local r
+    r=$(run_c dig +short +timeout=3 +tries=1 google.com | grep -E '^[0-9.]+$' | head -1)
+    if [[ -n "$r" ]]; then ok "resolution via Pi-hole confirmed → $r"; else warn "resolution check failed"; fi
+}
+
+# Full diagnostic across mode, services, network and DNS.
+cmd_status() {
+    init_timing
+    local exit_code=0
+
+    header "Environment"
+    local hname
+    hname=$(hostname 2>/dev/null) || hname=$(cat /etc/hostname 2>/dev/null) || hname=$(uname -n 2>/dev/null) || hname="unknown"
+    ok "Running on $hname (Pi-hole + Unbound server)"
+    local port
+    port=$(effective_port)
+    info "unbound port: $port"
+
+    # ── Mode ──────────────────────────────────────────────────────────────
+    header "Mode"
+    detect_mode
+    case "$MODE" in
+        dot)
+            echo -e "${GREEN}  MODE: DOT${NC} (DoT forwarding)"
+            [[ -n "$MODE_FILE" ]] && echo "  defining file: $MODE_FILE"
+            if [[ -n "$UPSTREAMS" ]]; then
+                local bad=0 u
+                for u in $UPSTREAMS; do
+                    if is_quad9_addr "$u"; then
+                        ok "upstream: $u (Quad9)"
+                    else
+                        warn "upstream: $u (NOT Quad9)"
+                        bad=1
+                    fi
+                done
+                [[ "$bad" -eq 1 ]] && { warn "Run 'unbound-manage dot' to force Quad9-only"; exit_code=1; }
+            else
+                fail "no forward-addr configured - run 'unbound-manage dot'"
+                exit_code=1
+            fi
+            ;;
+        recursive)
+            echo -e "${CYAN}  MODE: RECURSIVE${NC} (root hints + DNSSEC)"
+            local rh u52
+            if rh=$(find_root_hints); then ok "root-hints: $rh"; else info "root-hints: builtin"; fi
+            u52=$(unbound_uid)
+            if find_leak_chain; then
+                if leak_exemption_present; then
+                    ok "leak firewall: unbound exempted (skuid ${u52:-?}) in: ${LEAK_SPECS//$'\n'/ ; }"
+                else
+                    fail "leak firewall blocks outbound 53 for unbound - recursion cannot work"
+                    if [[ -n "$u52" ]]; then
+                        info "Fix: sudo unbound-manage recursive (adds the exemption), or"
+                        info "     sudo nft insert rule $LEAK_FAM $LEAK_TABLE $LEAK_CHAIN meta skuid $u52 udp dport 53 accept"
+                        info "     sudo nft insert rule $LEAK_FAM $LEAK_TABLE $LEAK_CHAIN meta skuid $u52 tcp dport 53 accept"
+                    fi
+                    exit_code=1
+                fi
+            fi
+            ;;
+        plain-forward)
+            echo -e "${YELLOW}  MODE: PLAIN FORWARD${NC} (unencrypted forward zone)"
+            warn "forward zone without TLS - run 'unbound-manage dot' or 'unbound-manage recursive'"
+            exit_code=1
+            ;;
+        *)
+            echo -e "${RED}  MODE: UNKNOWN${NC}"
+            fail "could not determine unbound mode"
+            exit_code=1
+            ;;
+    esac
+    local anchor
+    if anchor=$(find_root_anchor); then
+        ok "DNSSEC root anchor: $anchor"
+    else
+        warn "DNSSEC root anchor NOT found"
+        exit_code=1
+    fi
+
+    # ── Services ──────────────────────────────────────────────────────────
+    header "Services"
+    local s en
+    for s in unbound pihole-FTL tailscaled; do
+        if is_active "$s"; then
+            en="enabled"
+            is_enabled "$s" || en="NOT enabled at boot"
+            ok "$s: active ($en)"
+        else
+            fail "$s: NOT active"
+            exit_code=1
+        fi
+    done
+
+    # ── Tailscale ─────────────────────────────────────────────────────────
+    header "Tailscale"
+    local tsip
+    if tsip=$(detect_ts_ip); then
+        ok "this node: $tsip"
+        if run_q ping -c 1 -W 2 "$tsip"; then
+            ok "interface reachable (tailscale0)"
+        else
+            warn "tailscale0 not answering on $tsip"
+        fi
+        if has_cmd tailscale; then
+            local peers
+            peers=$(run_c tailscale status | tail -n +2 | grep -cPe '^[0-9]+\.' || true)
+            ok "peers: ${peers:-0}"
+        fi
+    else
+        warn "no Tailscale IP detected (tailscaled down?)"
+    fi
+
+    # ── Listeners ─────────────────────────────────────────────────────────
+    header "Listeners"
+    local l53 l5335
+    l53=$(run_c ss -tuln | grep -cE ":(${PIHOLE_PORT})\s" || true)
+    l5335=$(run_c ss -tuln | grep -cE ":(${port})\s" || true)
+    if [[ "$l53" -ge 1 ]]; then ok "port $PIHOLE_PORT: listening (Pi-hole)"; else warn "port $PIHOLE_PORT: nothing listening"; fi
+    if [[ "$l5335" -ge 1 ]]; then ok "port $port: listening (Unbound)"; else fail "port $port: nothing listening"; exit_code=1; fi
+
+    # ── Connectivity ──────────────────────────────────────────────────────
+    header "Connectivity"
+    local gw
+    gw=$(run_c ip -4 route show default | awk '{print $3; exit}')
+    if [[ -n "$gw" ]] && run_q ping -c 1 -W 2 "$gw"; then
+        ok "gateway $gw reachable"
+    else
+        warn "gateway ${gw:-unknown} not responding to ping"
+    fi
+    if run_q ping -c 1 -W 2 "${QUAD9_PRIMARY}"; then
+        ok "internet: ${QUAD9_PRIMARY} reachable"
+    else
+        fail "internet: ${QUAD9_PRIMARY} unreachable"
+        exit_code=1
+    fi
+    if run_q timeout 4 bash -c "echo > /dev/tcp/${QUAD9_PRIMARY}/853"; then
+        ok "DoT: TCP ${QUAD9_PRIMARY}:853 open"
+    else
+        warn "DoT: TCP ${QUAD9_PRIMARY}:853 blocked/unreachable"
+    fi
+
+    # ── resolv.conf ───────────────────────────────────────────────────────
+    header "resolv.conf"
+    local ns
+    ns=$(grep -m1 '^nameserver' "$RESOLV_CONF" 2>/dev/null | awk '{print $2}')
+    if [[ "$ns" == "127.0.0.1" ]]; then
+        ok "nameserver $ns (Pi-hole)"
+    elif [[ -z "$ns" ]]; then
+        fail "no nameserver in $RESOLV_CONF"
+        exit_code=1
+    else
+        warn "nameserver $ns - expected 127.0.0.1 (Pi-hole)"
+        info "Fix: sudo unbound-manage fix-resolv"
+    fi
+
+    # ── Pi-hole upstream ──────────────────────────────────────────────────
+    header "Pi-hole upstream"
+    local up
+    if has_cmd pihole-FTL; then
+        up=$(run_c pihole-FTL --config dns.upstreams || true)
+        if [[ "$up" == *"127.0.0.1#${port}"* ]]; then
+            ok "upstreams: $up (→ unbound :$port)"
+        else
+            warn "upstreams: ${up:-unreadable} - expected 127.0.0.1#${port}"
+        fi
+    else
+        warn "pihole-FTL not found (Pi-hole v5?)"
+    fi
+    local cnt
+    if has_cmd pihole-FTL && [[ -f /etc/pihole/gravity.db ]]; then
+        cnt=$(run_c pihole-FTL sqlite3 -ni /etc/pihole/gravity.db \
+              'SELECT COUNT(*) FROM vw_gravity;' || true)
+    fi
+    if [[ -z "${cnt:-}" ]] && has_cmd sqlite3 && [[ -f /etc/pihole/gravity.db ]]; then
+        cnt=$(run_c sqlite3 /etc/pihole/gravity.db \
+              'SELECT COUNT(*) FROM vw_gravity;' || \
+              run_c sqlite3 /etc/pihole/gravity.db \
+              'SELECT COUNT(*) FROM gravity;' || true)
+    fi
+    if [[ -n "${cnt:-}" ]]; then ok "gravity: $cnt blocked domains"; else warn "gravity count unreadable"; fi
+
+    # ── Resolution ────────────────────────────────────────────────────────
+    header "Resolution"
+    local r
+    r=$(run_c dig "@127.0.0.1" -p "$PIHOLE_PORT" +short +timeout=3 +tries=1 google.com | grep -E '^[0-9.]+$' | head -1)
+    if [[ -n "$r" ]]; then ok "pihole :$PIHOLE_PORT → $r"; else fail "pihole :$PIHOLE_PORT no response"; exit_code=1; fi
+
+    r=$(run_c dig "@127.0.0.1" -p "$port" +short +timeout=3 +tries=1 google.com | grep -E '^[0-9.]+$' | head -1)
+    if [[ -n "$r" ]]; then ok "unbound :$port → $r"; else fail "unbound :$port no response"; exit_code=1; fi
+
+    if [[ -n "${tsip:-}" ]]; then
+        r=$(run_c dig "@$tsip" -p "$PIHOLE_PORT" +short +timeout=3 +tries=1 google.com | grep -E '^[0-9.]+$' | head -1)
+        if [[ -n "$r" ]]; then
+            ok "tailscale $tsip:$PIHOLE_PORT → $r"
+        elif find_leak_chain; then
+            info "tailscale $tsip:$PIHOLE_PORT no response (expected: dropped by DNS-leak firewall)"
+        else
+            warn "tailscale $tsip:$PIHOLE_PORT no response"
+        fi
+    fi
+
+    # ── Blocking ──────────────────────────────────────────────────────────
+    header "Blocking"
+    local bl
+    bl=$(run_c dig "@127.0.0.1" -p "$PIHOLE_PORT" +short +timeout=3 +tries=1 doubleclick.net | head -1)
+    if [[ "$bl" == "0.0.0.0" ]] || [[ "$bl" =~ ^127\.0\.0\. ]] || [[ "$bl" == "::" ]]; then
+        ok "doubleclick.net → $bl (blocked)"
+    elif [[ -z "$bl" ]]; then
+        warn "doubleclick.net - no response"
+    else
+        warn "doubleclick.net → $bl (NOT blocked)"
+        exit_code=1
+    fi
+
+    # ── DNSSEC ────────────────────────────────────────────────────────────
+    header "DNSSEC"
+    local bad good
+    bad=$(run_c dig "@127.0.0.1" -p "$port" +timeout=5 +tries=1 dnssec-failed.org +noall +comments | grep -o 'status: [A-Z]*' | head -1)
+    if [[ "$bad" == "status: SERVFAIL" ]]; then
+        ok "dnssec-failed.org → SERVFAIL (validation active)"
+    else
+        fail "dnssec-failed.org → ${bad:-no response} (expected SERVFAIL)"
+        exit_code=1
+    fi
+    good=$(run_c dig "@127.0.0.1" -p "$port" +timeout=5 +tries=1 www.ietf.org +noall +comments | grep -o 'status: [A-Z]*' | head -1)
+    if [[ "$good" == "status: NOERROR" ]]; then
+        ok "www.ietf.org → NOERROR"
+    else
+        fail "www.ietf.org → ${good:-no response}"
+        exit_code=1
+    fi
+
+    # ── DoT activity ──────────────────────────────────────────────────────
+    if [[ "$MODE" == "dot" ]]; then
+        header "DoT activity"
+        local qp qs
+        qp="${QUAD9_PRIMARY//./\\.}"
+        qs="${QUAD9_SECONDARY//./\\.}"
+        local tls
+        tls=$(run_c ss -tnH state established '( dport = :853 )' | grep -cE "$qp|$qs" || true)
+        if [[ "${tls:-0}" -lt 1 ]]; then
+            run_q dig "@127.0.0.1" -p "$port" +short +timeout=3 "warm-$(date +%s%N).google.com" || true
+            sleep 1
+            tls=$(run_c ss -tnH state established '( dport = :853 )' | grep -cE "$qp|$qs" || true)
+        fi
+        if [[ "$tls" -ge 1 ]]; then
+            ok "$tls live TLS connection(s) to Quad9:853"
+        else
+            info "no live DoT connection observed (Quad9 may have closed idle pool)"
+        fi
+    fi
+
+    # ── DNS-leak firewall ─────────────────────────────────────────────────
+    header "DNS-leak firewall"
+    if [[ "$(id -u)" -ne 0 ]]; then
+        info "run with sudo for the nftables check"
+    elif has_cmd nft; then
+        local rules
+        rules=$(run_c nft list ruleset | grep -c 'dport 53' || true)
+        if [[ "$rules" -ge 1 ]]; then
+            ok "nftables: $rules rule(s) for port 53 (cleartext DNS blocked)"
+        else
+            warn "nftables: no port-53 rules - cleartext DNS may leak"
+        fi
+    else
+        warn "nft not available - cannot verify leak protection"
+    fi
+
+    # ── Verdict ───────────────────────────────────────────────────────────
+    echo ""
+    if [[ "$exit_code" -eq 0 ]]; then
+        ok "${BOLD}All checks passed${NC} ($(elapsed)ms)"
+    else
+        fail "${BOLD}Issues detected${NC} ($(elapsed)ms)"
+    fi
+    return "$exit_code"
+}
+
+# Show usage.
+cmd_help() {
+    cat << EOF
+Usage: unbound-manage {status|dot|recursive|fix-resolv|default|help} [--persistent]
+
+Runs ONLY on the Pi-hole + Unbound server (auto-guarded).
+
+Modes:
+  dot [--persistent]         Switch Unbound to DoT forwarding -> Quad9 ONLY         [~3-5s]
+               Removes any non-Quad9 upstream (e.g. Cloudflare).
+               DNSSEC validation stays active (unbound validates itself).
+
+  recursive [--persistent]   Switch Unbound to full recursion                       [~3-5s]
+               Root hints + DNSSEC root anchor + qname minimisation.
+               No forwarders: unbound queries the root servers directly.
+
+  default [dot|recursive|clear|show]  Saved boot default, no switch.
+               dot means base file only. Without a saved file the host
+               boots on dot blocking (secure default).
+
+  status      Full diagnostic                                        [~5-8s]
+               Mode, services, Tailscale, listeners, connectivity,
+               resolv.conf, Pi-hole upstream, resolution, blocking,
+               DNSSEC, DoT activity, DNS-leak firewall.
+
+  fix-resolv  Point /etc/resolv.conf to 127.0.0.1 (Pi-hole)          [~1-2s]
+
+  --debug     Show every command executed + its raw output, instead of
+               silencing them (use it as first or last argument).
+
+  help        This help.
+
+Notes:
+  - Tailscale IP is auto-detected (tailscale ip -4).
+  - Both modes keep DNSSEC validation + harden-dnssec-stripped: yes,
+    protecting against forged/transparent-proxy DNS answers.
+  - Config is applied atomically; on failure the new mode stays active and
+    the manual restore commands are printed (no automatic rollback).
+  - Running a mode that is already active is a no-op (unbound untouched).
+  - DNS-leak firewall (nftables dport-53 drop): 'recursive' inserts a
+    per-process exemption for unbound (meta skuid), 'dot' removes it.
+  - Boot default is dot. With --persistent the mode is saved to
+    /var/lib/unbound-manage/mode and reapplied at boot by
+    unbound-manage-restore.service (enabled by the installer).
+
+Examples:
+  sudo unbound-manage dot         # Quad9 DoT now
+  sudo unbound-manage recursive --persistent  # Recursion now and after reboot
+  sudo unbound-manage default show            # Show saved boot default
+  sudo unbound-manage default clear           # Back to plain dot boot
+  unbound-manage status           # Health check (no root needed)
+  sudo unbound-manage --debug recursive   # Same, showing every command
+EOF
+}
+
+# Entry point with server guard and root check.
+main() {
+    local args=() a
+    for a in "$@"; do
+        case "$a" in
+            --debug|-d) DBG=1 ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    set -- "${args[@]}"
+    local mode="${1:-}"
+
+    [ -z "$mode" ] && { cmd_help; exit 0; }
+    (( DBG )) && info "debug mode: every command is shown as it runs (raw output included)"
+
+    # Help works anywhere, everything else needs the server itself.
+    case "$mode" in
+        help|--help|-h) cmd_help; exit 0 ;;
+    esac
+
+    # Guard: this script belongs on the Pi-hole + Unbound server.
+    local has_pihole has_unbound has_dig
+    has_pihole=$([[ -d /etc/pihole ]] && echo yes || echo no)
+    has_unbound=$([[ -d /etc/unbound ]] && echo yes || echo no)
+    has_dig=$(has_cmd dig && echo yes || echo no)
+    if [[ "$has_pihole" == "no" ]] || [[ "$has_unbound" == "no" ]] || \
+       [[ "$has_dig" == "no" ]]; then
+        fail "This script must run on the Pi-hole + Unbound server itself"
+        info "Detected: /etc/pihole=$has_pihole, /etc/unbound=$has_unbound, dig=$has_dig"
+        exit 1
+    fi
+    if [[ ! -d "$CONF_DIR" ]]; then
+        warn "$CONF_DIR does not exist - creating it"
+        mkdir -p "$CONF_DIR" 2>/dev/null || { fail "cannot create $CONF_DIR (root needed)"; exit 1; }
+    fi
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        case "$mode" in
+            status|help|--help|-h|default) ;;
+            *)
+                fail "This mode requires root: sudo unbound-manage $mode"
+                exit 1
+                ;;
+        esac
+    fi
+
+    case "$mode" in
+        dot)          shift; cmd_dot "$@" || exit $? ;;
+        recursive)    shift; cmd_recursive "$@" || exit $? ;;
+        default)      shift; cmd_default "$@" || exit $? ;;
+        fix-resolv)   cmd_fix_resolv || exit $? ;;
+        status)       cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            fail "Unknown mode: $mode"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

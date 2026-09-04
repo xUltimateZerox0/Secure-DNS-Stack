@@ -1,0 +1,14 @@
+[Unit]
+Description=Reapply saved Unbound mode and firewall exemption
+After=nftables.service unbound.service network-online.target
+Wants=nftables.service network-online.target
+Before=pihole-FTL.service
+ConditionPathExists=/var/lib/unbound-manage/mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'exec /usr/local/bin/unbound-manage "$(cat /var/lib/unbound-manage/mode)"'
+
+[Install]
+WantedBy=multi-user.target
