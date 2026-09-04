@@ -55,7 +55,7 @@ Usage: sudo ./install.sh [--dry-run] [--yes] [--allow-unsupported] [--takeover]
 
   --dry-run            Print actions, change nothing. Safe on any machine.
   --yes                Skip confirmations. Only for fresh dedicated hardware.
-  --allow-unsupported  Run on non-Debian-family OS at your own risk.
+  --allow-unsupported  Try on non-Debian-family OS (untested, may fail).
   --takeover           Replace customized configs (backup kept).
 EOF
 }
@@ -129,7 +129,7 @@ preflight() {
     (( missing )) && exit 1
 
     # Unknown listener on 53 means someone else owns DNS here.
-    # Our own daemons are fine and never prompt on re-runs.
+    # My own daemons are fine and never prompt on re-runs.
     local holder unknown
     holder=$(ss -tulpn 2>/dev/null | grep -E ':(53|5335) ' || true)
     if [[ -n "$holder" ]]; then
@@ -139,7 +139,7 @@ preflight() {
             echo "$unknown"
             confirm_or_exit "Third-party DNS detected. Take over?"
         else
-            log "Listeners are our own daemons, continuing."
+            log "Listeners are my own daemons, continuing."
         fi
     fi
     [[ -n "${SSH_CONNECTION:-}" ]] && log "Over SSH: network steps may drop you; reconnect and re-run."
@@ -344,7 +344,7 @@ phase_resolver() {
 phase_nftables() {
     log "Phase nftables"
     # Never silently replace someone else's firewall: only tables outside
-    # our own "inet filter" count as foreign (UFW/Tailscale live in RAM,
+    # only my "inet filter" table is mine: anything else counts as foreign (UFW/Tailscale live in RAM,
     # not in this file). Backup is kept in every case.
     if [[ -f /etc/nftables.conf ]] \
         && ! cmp -s "${SCRIPT_DIR}/configs/etc/nftables.conf" /etc/nftables.conf 2>/dev/null; then
@@ -358,7 +358,7 @@ phase_nftables() {
         fi
         (( TAKEOVER )) && log "Takeover requested, replacing with backup kept."
     fi
-    # Same for the live table we destroy: anything beyond our drops and
+    # Same for the live table we destroy: anything beyond my drops and
     # skuid accepts means someone else filters there.
     if (( ! TAKEOVER )); then
         local live rest
@@ -449,7 +449,7 @@ phase_unbound() {
         "$src" > "$tmp"
     DEPLOY_CHANGED=0
     local dst="/etc/unbound/unbound.conf.d/pi-hole.conf"
-    # A foreign pi-hole.conf without our marker is never overwritten blindly.
+    # A foreign pi-hole.conf without my marker is never overwritten blindly.
     if [[ -f "$dst" ]] && ! grep -q "Managed by secure-dns-stack" "$dst" 2>/dev/null \
         && (( ! TAKEOVER )); then
         log "Foreign $dst found, refusing to overwrite it."
@@ -493,7 +493,7 @@ phase_unbound() {
 phase_pihole() {
     log "Phase pihole"
     # Adopt-only: an existing Pi-hole keeps its install, we enforce only
-    # our three keys plus blocklists. Fresh installs stay manual for now:
+# my three keys plus blocklists. Fresh installs stay manual for now:
     # unattended setup needs static-IP decisions this script must not guess.
     local has_ftl=0 has_cli=0
     command -v pihole-FTL >/dev/null 2>&1 && has_ftl=1

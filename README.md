@@ -47,6 +47,7 @@ Unlike standard Docker deployments, this stack is built directly on bare-metal t
 **⚠️ Out-of-Scope (Known Limitations):**
 *   **SNI Leaks & Traffic Analysis:** Even with DoT encrypting the DNS lookup, the ISP **can still determine** which websites are visited via the plaintext SNI (Server Name Indication) in subsequent HTTPS connections. This stack does **not** provide Tor-like anonymity.
 *   **Recursive Mode Cleartext:** When switching to Iterative Root Resolution, queries to authoritative servers are made in cleartext (port 53). While this makes the resolution independent from any third-party DNS provider, and uses DNSSEC for signed zones to ensure integrity, confidentiality from the ISP is lost.
+*   **Encrypted DNS Bypass (DoH and Local DoT Clients):** Applications using hard-coded DNS-over-HTTPS, or any local process reaching port 853 directly, bypass Pi-hole entirely. The firewall governs cleartext DNS on port 53 only; endpoint control of such clients is outside this stack.
 
 ## Operations & State Management
 
@@ -136,25 +137,29 @@ $ sudo unbound-manage status
  ✔ All checks passed (3592ms)
 ```
 
-## Debugging notes (WORK IN PROGRESS)
+## Debugging notes
 
-Incident trail (symptom → cause → fix): see [docs/debugging.md](docs/debugging.md).
+Incident trail (symptom → cause → fix) is collected in [docs/debugging.md](docs/debugging.md) as production runs teach new ones.
 
-## Installation & Deployment (WORK IN PROGRESS)
+## Installation & Deployment
 
 ⚠️ **Environment Warning:** This stack is designed exclusively for dedicated bare-metal hardware. The installation **deeply** modifies system network states. **Do not deploy this on a daily-driver machine**
 
-The repository includes a deployment script (`install.sh`) that automates the entire setup of the DNS infrastructure.
+The repository includes a deployment script (`install.sh`) that converges a Debian-family machine to the configs in this repo. It is idempotent, backs up every replaced file under `/var/backups/secure-dns-stack` with checksums, and refuses to silently replace customized firewalls or configs without `--takeover`.
 
 **Supported Operating Systems:**
-*   Debian 13 "trixie" (tested)
+*   Debian 13 "trixie" (tested on production server)
+*   Raspberry Pi OS and Armbian (Debian-family, same package set)
+*   Other systems are not covered by my tests; `--allow-unsupported` lets you try anyway and report back
 
-**What the script does:** 
-1.  Disables and masks `systemd-resolved` to free port 53.
-2.  Installs core dependencies (`pihole`, `unbound`, `nftables`, `dns-root-data`).
-3.  Deploys the static `unbound` configuration and `nftables` leak-prevention ruleset.
-4.  Locks `/etc/resolv.conf` to point exclusively to the local Pi-hole instance (`127.0.0.1`).
-5.  Sets up `unbound-manage` in `/usr/local/bin` for mode switching.
+**What the script does:**
+1.  Preflight checks (root, systemd, OS family, free disk, port holders) with `--dry-run` available.
+2.  Installs core dependencies (`unbound`, `nftables`, `dns-root-data`, `bind9-dnsutils`, `ca-certificates`, `curl`, `sqlite3`, `iproute2`).
+3.  Disables `systemd-resolved`/`resolvconf` stubs when present and locks `/etc/resolv.conf` to `127.0.0.1`, shielded from NetworkManager.
+4.  Deploys the `nftables` leak-prevention ruleset without touching other tables, plus Unbound base tuned to installed RAM.
+5.  Adopts an existing Pi-hole install: enforces upstream `127.0.0.1#5335`, HTTPS-only admin and blocklists. Pi-hole itself is installed beforehand with the official installer.
+6.  Installs `unbound-manage` in `/usr/local/bin` and enables the boot restore service, then adds UFW DNS allows only.
+7.  Verifies everything with `unbound-manage status`.
 
 ### Quick Start
 
@@ -163,13 +168,16 @@ The repository includes a deployment script (`install.sh`) that automates the en
 git clone https://github.com/xUltimateZerox0/Secure-DNS-Stack.git
 cd Secure-DNS-Stack
 
-# 2. Review the script (Always recommended, especially since the script requires root privileges)
-cat install.sh
+# 2. Review the installer (700 lines, root privileges: skim it, then trust but verify)
+less install.sh
 
-# 3. Execute deployment
+# 3. Preview without changing anything
+sudo ./install.sh --dry-run
+
+# 4. Execute deployment (add --takeover only to replace customized configs)
 sudo ./install.sh
 
-# 4. Verify the deployment
+# 5. Verify the deployment
 sudo unbound-manage status
 ```
 

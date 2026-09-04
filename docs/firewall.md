@@ -44,3 +44,5 @@ Admin HTTPS on port 443 follows the same interfaces.
   the operator selects recursive. A persistent choice can be saved with
   `sudo unbound-manage recursive|dot --persistent` or
   `sudo unbound-manage default recursive|dot`.
+- Backup storage: backups under `/var/backups/secure-dns-stack` are root-only
+  `0700`, not encrypted. Encrypt the volume on shared hardware.

@@ -127,7 +127,7 @@ raw_declared() {
 }
 
 # Options declared in OTHER files (excluding the managed one).
-# They survive a mode switch and must not be redeclared in our file.
+# They survive a mode switch and must not be redeclared in the managed file.
 other_declared() {
     local opt="$1" f
     for f in "$CONF_DIR"/*.conf; do
@@ -259,7 +259,7 @@ find_leak_chain() {
     return 0
 }
 
-# Handles of our unbound exemption rules for deletion.
+# Handles of the unbound exemption rules for deletion.
 leak_exemption_handles() {
     find_leak_chain || return 1
     nft_available || return 1
@@ -335,7 +335,7 @@ leak_remove_exemption() {
 detect_mode() {
     MODE="unknown"; MODE_FILE=""; UPSTREAMS=""
 
-    # Source of truth: our managed file if present, else any file with a
+    # Source of truth: the managed file if present, else any file with a
     # root (".") forward zone, else recursion.
     local f
     if [[ -f "$CONF_FILE" ]]; then
