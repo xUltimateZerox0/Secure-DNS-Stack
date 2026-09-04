@@ -1,0 +1,13 @@
+# Static LAN for DNS server, DHCP disabled for eno1.
+# Copy to /etc/network/interfaces, set ADDRESS/GATEWAY for your LAN.
+# Never store wifi PSK here, use nmtui or a 600-perm file.
+auto lo
+iface lo inet loopback
+
+auto eno1
+iface eno1 inet static
+    address 192.168.1.2/24
+    gateway 192.168.1.1
+
+iface eno1 inet6 static
+    address fd42::2/64
