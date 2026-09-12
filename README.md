@@ -145,10 +145,11 @@ Incident trail (symptom → cause → fix) is collected in [docs/debugging.md](d
 
 ⚠️ **Environment Warning:** This stack is designed exclusively for dedicated bare-metal hardware. The installation **deeply** modifies system network states. **Do not deploy this on a daily-driver machine**
 
-The repository includes a deployment script (`install.sh`) that converges a Debian-family machine to the configs in this repo. It is idempotent, backs up every replaced file under `/var/backups/secure-dns-stack` with checksums, and refuses to silently replace customized firewalls or configs without `--takeover`.
+The repository includes a deployment script (`install.sh`) that converges a Debian-family machine to the configs in this repo. It is idempotent, backs up every replaced file under `/var/backups/secure-dns-stack` with checksums, and refuses to silently replace customized firewalls or configs without `--takeover`. A failed `unbound-checkconf` reverts the just-deployed file before the daemon is touched.
 
 **Supported Operating Systems:**
-*   Debian 13 "trixie" (tested on production server)
+*   Debian 13 "trixie" (tested)
+*   DietPi (Debian-family, passes preflight as `debian', tested)
 *   Raspberry Pi OS and Armbian (Debian-family, same package set)
 *   Other systems are not covered by my tests; `--allow-unsupported` lets you try anyway and report back
 

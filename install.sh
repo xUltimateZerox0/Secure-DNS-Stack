@@ -6,7 +6,8 @@
 # Order: preflight -> backup -> packages -> resolver lock -> nftables ->
 # unbound -> pihole (incl. managed keys) -> unbound-manage -> ufw -> verify.
 # Each phase verifies before the next starts. On failure the script stops
-# and prints restore paths, it never auto-rolls back.
+# and prints restore paths; only a file that fails validation is reverted
+# before any daemon reload, services themselves are never auto-rolled back.
 
 set -uo pipefail
 
@@ -48,6 +49,20 @@ confirm_or_exit() {
         log "Partials keep backups in $BACKUP_DIR, restore with: sudo cp -a $BACKUP_DIR/<path> <path>"
     fi
     exit 1
+}
+
+# Basename allowlist for files that are never silently replaced.
+is_protected_unbound_name() {
+    local base
+    base=$(basename "${1:-}")
+    [[ "$base" == "dietpi.conf" || "$base" == "pi-hole.conf" || "$base" == "pihole.conf" ]]
+}
+
+ask_protected_overwrite() {
+    local prompt="${1:-Overwrite?}" answer
+    echo -n "$prompt [y/N] "
+    read -r answer </dev/tty 2>/dev/null || read -r answer || answer="N"
+    [[ "${answer:-N}" =~ ^[yY]$ ]]
 }
 
 usage() {
@@ -431,6 +446,52 @@ phase_nftables() {
         log "nftables verified: 4 drops, no duplicates."
     fi
 }
+
+unbound_file_has_root_forward() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -q 'forward-zone:' || return 1
+    grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -q 'name: "\.'
+}
+
+# Files unbound really loads
+list_unbound_config_files() {
+    local main="${1:-/etc/unbound/unbound.conf}" inc pat f
+    [[ -f "$main" ]] && echo "$main"
+    inc=$(grep -hE '^[[:space:]]*include(-toplevel)?:' "$main" 2>/dev/null \
+        | sed -E 's/^[^:]*:[[:space:]]*//; s/^"//; s/"[[:space:]]*$//; s/^'"'"'//; s/'"'"'[[:space:]]*$//' || true)
+    if [[ -z "$inc" ]]; then
+        for f in /etc/unbound/unbound.conf.d/*.conf; do
+            [[ -f "$f" ]] && echo "$f"
+        done
+    else
+        shopt -s nullglob
+        while IFS= read -r pat; do
+            [[ -n "$pat" ]] || continue
+            # Relative includes resolve against /etc/unbound (daemon CWD may differ).
+            [[ "$pat" == /* ]] || pat="/etc/unbound/$pat"
+            if [[ "$pat" == *[\*\?\[]* ]]; then
+                # shellcheck disable=SC2086: intentional glob expansion of the pattern.
+                for f in $pat; do [[ -f "$f" ]] && echo "$f"; done
+            else
+                [[ -f "$pat" ]] && echo "$pat"
+            fi
+        done <<< "$inc"
+        shopt -u nullglob
+    fi | sort -u
+}
+find_unbound_root_forwarders() {
+    local dst="${1:-/etc/unbound/unbound.conf.d/pi-hole.conf}" f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        [[ "$f" == "$dst" ]] && continue
+        [[ "$f" == "/etc/unbound/unbound.conf.d/unbound-manage.conf" ]] && continue
+        if unbound_file_has_root_forward "$f"; then
+            echo "$f"
+        fi
+    done < <(list_unbound_config_files /etc/unbound/unbound.conf)
+}
+
 phase_unbound() {
     log "Phase unbound"
     # Managed machines own their config via unbound-manage.conf, never
@@ -459,18 +520,103 @@ phase_unbound() {
         "$src" > "$tmp"
     DEPLOY_CHANGED=0
     local dst="/etc/unbound/unbound.conf.d/pi-hole.conf"
-    # A foreign pi-hole.conf without my marker is never overwritten blindly.
+    # A foreign pi-hole.conf without my marker is never overwritten blindly:
     if [[ -f "$dst" ]] && ! grep -q "Managed by secure-dns-stack" "$dst" 2>/dev/null \
         && (( ! TAKEOVER )); then
-        log "Foreign $dst found, refusing to overwrite it."
-        log "Merge manually or re-run with --takeover (backup is kept)."
-        rm -f "$tmp"
-        return 1
+        if (( DRY_RUN )); then
+            log "DRY-RUN: would ask to replace foreign $dst (backup kept) or abort."
+        elif ask_protected_overwrite "Replace foreign $dst with the stack version? (backup kept)"; then
+            log "Overwrite confirmed for $dst (backup kept)."
+        else
+            log "Keeping foreign $dst."
+            log "Merge manually or re-run with --takeover (backup is kept)."
+            rm -f "$tmp"
+            return 1
+        fi
     fi
+    # Sibling files conflicts
+    local conflicts
+    local disabled_pairs=()
+    conflicts=$(find_unbound_root_forwarders "$dst")
+    if [[ -n "$conflicts" ]]; then
+        log "Conflicting root forward-zone in sibling file(s):"
+        echo "$conflicts" | while read -r f; do
+            [[ -n "$f" ]] || continue
+            log "  - $f"
+            grep -nE 'forward-(zone|addr):|name:' "$f" 2>/dev/null | head -5 | while read -r l; do log "      $l"; done
+        done
+        local protected other
+        protected=$(echo "$conflicts" | while read -r f; do
+            [[ -n "$f" ]] || continue
+            is_protected_unbound_name "$f" && echo "$f"
+        done)
+        if (( DRY_RUN )); then
+            log "DRY-RUN: would ask to disable sibling(s) above (backup kept) or abort."
+        elif (( TAKEOVER )); then
+            log "Takeover requested, disabling sibling(s) with backup kept."
+        elif [[ -n "$protected" ]]; then
+           #Custom files are protected, don't worry.
+            if ask_protected_overwrite "Disable protected file(s) above and continue? (backup kept)"; then
+                log "Overwrite confirmed for protected file(s) (backup kept)."
+            else
+                log "Keeping protected file(s)."
+                log "Merge manually or re-run with --takeover (backup is kept)."
+                rm -f "$tmp"
+                return 1
+            fi
+        elif (( ASSUME_YES )); then
+            log "Unattended (--yes) without --takeover: refusing to disable customized unbound config."
+            log "Merge manually or re-run with --takeover (backup is kept)."
+            rm -f "$tmp"
+            return 1
+        else
+            confirm_or_exit "Disable conflicting sibling(s) above and continue?" \
+                || { rm -f "$tmp"; return 1; }
+        fi
+        if (( ! DRY_RUN )); then
+            local f dis expect
+            while read -r f; do
+                [[ -n "$f" ]] || continue
+                if [[ "$f" == "/etc/unbound/unbound.conf" ]]; then
+                    rm -f "$tmp"
+                    log "Root forward-zone lives in $f itself: edit it manually, refusing to move the main config."
+                    return 1
+                fi
+                [[ -n "${BACKUP_DIR:-}" && -d "$BACKUP_DIR" ]] \
+                    || { rm -f "$tmp"; log "No backup dir, refusing to touch $f."; return 1; }
+                backup_path "$f"
+                expect="${BACKUP_DIR}${f}"
+                [[ -e "$expect" ]] \
+                    || { rm -f "$tmp"; log "Backup missing for $f (want $expect), aborting."; return 1; }
+                dis="${f}.disabled.$(date +%Y%m%d-%H%M%S)"
+                mutate mv -f "$f" "$dis" || { rm -f "$tmp"; log "Could not disable $f."; return 1; }
+                disabled_pairs+=("$dis:$f")
+                log "Disabled sibling: $f -> $(basename "$dis") (backup kept)"
+            done <<< "$conflicts"
+        fi
+    fi
+    local others
+    others=$(list_unbound_config_files /etc/unbound/unbound.conf 2>/dev/null | grep -v -e "$dst" -e "unbound-manage.conf" || true)
+    if [[ -n "$others" && -z "$conflicts" ]]; then
+        log "Sibling unbound configs present (kept as-is):"
+        echo "$others" | while read -r f; do [[ -n "$f" ]] && log "  - $f"; done
+    fi
+    local had_dst=0
+    [[ -f "$dst" ]] && had_dst=1
     if cmp -s "$tmp" "$dst" 2>/dev/null; then
         log "Unchanged: $dst"
     else
+        if (( ! DRY_RUN )) && [[ -e "$dst" ]]; then
+            [[ -n "${BACKUP_DIR:-}" && -d "$BACKUP_DIR" ]] \
+                || { rm -f "$tmp"; log "No backup dir, refusing to touch $dst."; return 1; }
+        fi
         backup_path "$dst"
+        if (( ! DRY_RUN )) && [[ "$had_dst" -eq 1 || -e "$dst" ]]; then
+            # had_dst was captured before; if file existed, backup must exist now.
+            if (( had_dst == 1 )) && [[ ! -e "${BACKUP_DIR}${dst}" ]]; then
+                rm -f "$tmp"; log "Backup missing for $dst, aborting."; return 1
+            fi
+        fi
         if (( DRY_RUN )); then
             log "DRY-RUN deploy: rendered pi-hole.conf -> $dst (threads=$UNBOUND_THREADS msg=$UNBOUND_MSG rrset=$UNBOUND_RRSET)"
         else
@@ -484,8 +630,39 @@ phase_unbound() {
         fi
     fi
     if (( DRY_RUN )); then rm -f "$tmp"; return 0; fi
-    unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1 \
-        || { rm -f "$tmp"; log "unbound-checkconf rejected the config."; return 1; }
+    # Full-config check with visible errors 
+    local chk_out chk_rc
+    chk_out=$(unbound-checkconf /etc/unbound/unbound.conf 2>&1)
+    chk_rc=$?
+    if (( chk_rc != 0 )); then
+        log "unbound-checkconf rejected the full configuration:"
+        echo "$chk_out" | head -10 | while read -r l; do log "  $l"; done
+        # Re-enable siblings disabled above
+        local pair d o
+        for pair in "${disabled_pairs[@]:-}"; do
+            d="${pair%%:*}"; o="${pair#*:}"
+            [[ -f "$d" ]] || continue
+            mutate mv -f "$d" "$o" || true
+            log "Re-enabled sibling: $o"
+        done
+        if (( had_dst == 0 )); then
+            rm -f "$dst"
+            log "Reverted: removed just-deployed $dst (no prior file)."
+        else
+            local b
+            b="${BACKUP_DIR}${dst}"
+            if [[ -f "$b" ]]; then
+                cp -a "$b" "$dst"
+                log "Reverted: restored $dst from backup."
+            else
+                log "No backup found for $dst, manual check needed."
+            fi
+        fi
+        log "Hint: likely clash with dietpi.conf or another sibling (see list above)."
+        log "Merge manually or re-run with --takeover (backup is kept)."
+        rm -f "$tmp"
+        return 1
+    fi
     log "unbound-checkconf: full config valid"
     mutate systemctl enable unbound
     if (( DEPLOY_CHANGED )) || ! systemctl is-active --quiet unbound 2>/dev/null; then
@@ -583,12 +760,16 @@ phase_pihole() {
     fi
     if [[ -f /etc/pihole/gravity.db ]]; then
         backup_path /etc/pihole/gravity.db
-        local url
+        local url url_esc
         while read -r url; do
             [[ "$url" =~ ^#.*$ || -z "$url" ]] && continue
             if (( ! DRY_RUN )); then
+                # Escape single quotes: sqlite3_exec runs every statement in
+                # the string, so an unescaped quote would allow a second
+                # statement. Source is repo-controlled, this is defense in depth.
+                url_esc=${url//\'/\'\'}
                 sqlite3 /etc/pihole/gravity.db \
-                    "INSERT OR IGNORE INTO adlist (address, enabled, comment) VALUES ('$url', 1, 'secure-dns-stack');" \
+                    "INSERT OR IGNORE INTO adlist (address, enabled, comment) VALUES ('$url_esc', 1, 'secure-dns-stack');" \
                     2>/dev/null || log "Adlist insert skipped: $url"
             else
                 log "DRY-RUN adlist: $url"

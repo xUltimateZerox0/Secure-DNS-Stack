@@ -388,10 +388,31 @@ is_quad9_addr() {
     return 1
 }
 
+# RAM profile shared with install.sh mem_profile(): same buckets, same caps. This is NOT preallocation.
+mem_profile_for_render() {
+    local kb threads
+    kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    threads=$(nproc 2>/dev/null || echo 2)
+    MEM_THREADS=2; MEM_MSG="128m"; MEM_RRSET="256m"
+    if (( kb > 0 && kb <= 1048576 )); then
+        MEM_THREADS=1; MEM_MSG="32m";  MEM_RRSET="64m"
+    elif (( kb > 0 && kb <= 2097152 )); then
+        MEM_THREADS=1; MEM_MSG="64m";  MEM_RRSET="128m"
+    else
+        MEM_THREADS=2; MEM_MSG="128m"; MEM_RRSET="256m"
+        (( threads < 2 )) && MEM_THREADS=1
+    fi
+    # Fallback when MemTotal unreadable: safe small defaults.
+    if ! [[ "$kb" =~ ^[0-9]+$ ]] || (( kb == 0 )); then
+        MEM_THREADS=1; MEM_MSG="64m"; MEM_RRSET="128m"
+    fi
+}
+
 # Render a full mode config file, skip options owned by other files.
 render_config() {
     local mode="$1" out_file="$2"
     local port doip6 config=""
+    mem_profile_for_render
 
     # Port and interfaces come from other files when declared there.
     local declared_port declared_ifaces declared_doip6 declared_anchor declared_reuseport
@@ -427,9 +448,9 @@ render_config() {
     config+="    # Performance\n"
     config+="    prefetch: yes\n"
     config+="    prefetch-key: yes\n"
-    config+="    num-threads: 2\n"
-    config+="    msg-cache-size: 128m\n"
-    config+="    rrset-cache-size: 256m\n"
+    config+="    num-threads: $MEM_THREADS\n"
+    config+="    msg-cache-size: $MEM_MSG\n"
+    config+="    rrset-cache-size: $MEM_RRSET\n"
     config+="    cache-min-ttl: 3600\n"
     config+="    cache-max-ttl: 86400\n"
     config+="    so-rcvbuf: 1m\n"
@@ -489,17 +510,50 @@ render_config() {
     chmod 644 "$out_file" 2>/dev/null || true
 }
 
+# Comment lines (Debian example snippets) never count as declarations.
+unbound_file_has_root_forward() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -q 'forward-zone:' || return 1
+    grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -q 'name: "\.'
+}
+
+# Files unbound really loads: MAIN_CONF plus expanded include patterns.
+list_loaded_unbound_files() {
+    local inc pat f
+    [[ -f "$MAIN_CONF" ]] && echo "$MAIN_CONF"
+    inc=$(grep -hE '^[[:space:]]*include(-toplevel)?:' "$MAIN_CONF" 2>/dev/null \
+        | sed -E 's/^[^:]*:[[:space:]]*//; s/^"//; s/"[[:space:]]*$//; s/^'"'"'//; s/'"'"'[[:space:]]*$//' || true)
+    if [[ -z "$inc" ]]; then
+        for f in "$CONF_DIR"/*.conf; do
+            [[ -f "$f" ]] && echo "$f"
+        done
+    else
+        shopt -s nullglob
+        while IFS= read -r pat; do
+            [[ -n "$pat" ]] || continue
+            [[ "$pat" == /* ]] || pat="$(dirname "$MAIN_CONF")/$pat"
+            if [[ "$pat" == *[\*\?\[]* ]]; then
+                # shellcheck disable=SC2086: intentional glob expansion of the pattern.
+                for f in $pat; do [[ -f "$f" ]] && echo "$f"; done
+            else
+                [[ -f "$pat" ]] && echo "$pat"
+            fi
+        done <<< "$inc"
+        shopt -u nullglob
+    fi | sort -u
+}
+
 # Find other files with a root forward zone that would conflict.
 find_conflicting_files() {
     local f
-    for f in "$CONF_DIR"/*.conf; do
-        [[ -f "$f" ]] || continue
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
         [[ "$f" == "$CONF_FILE" ]] && continue
-        if grep -q 'forward-zone:' "$f" 2>/dev/null && \
-           grep -q 'name: "\.' "$f" 2>/dev/null; then
+        if unbound_file_has_root_forward "$f"; then
             echo "$f"
         fi
-    done
+    done < <(list_loaded_unbound_files)
 }
 
 # Reload with control channel, restart as fallback.
@@ -661,48 +715,77 @@ apply_mode() {
     TMP_CONF="$tmp"
     render_config "$target" "$tmp" || { fail "config rendering failed"; return 1; }
 
+    # Smoke check on the snippet as standalone main config
+
     if ! run_q "$UNBOUND_CHECKCONF_BIN" "$tmp"; then
         fail "unbound-checkconf rejected the new configuration"
         "$UNBOUND_CHECKCONF_BIN" "$tmp" 2>&1 | head -5
         return 1
     fi
-    ok "unbound-checkconf: config valid"
+    ok "unbound-checkconf: snippet syntax valid (threads=$MEM_THREADS msg=$MEM_MSG rrset=$MEM_RRSET)"
 
-    # 2. Backup current managed config (keep last 3)
+    # 2. Backup current managed config (keep last 3). Abort if backup missing.
     local backup=""
     if [[ -f "$CONF_FILE" ]]; then
         backup="${CONF_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp -a "$CONF_FILE" "$backup"
+        cp -a "$CONF_FILE" "$backup" \
+            || { fail "backup failed for $CONF_FILE, aborting"; return 1; }
+        [[ -f "$backup" ]] \
+            || { fail "backup missing for $CONF_FILE, aborting"; return 1; }
         ok "backup: $(basename "$CONF_FILE") → $(basename "$backup")"
         find "$CONF_DIR" -maxdepth 1 -name 'unbound-manage.conf.backup.*' \
              -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +4 \
              | cut -d' ' -f2- | xargs -r rm -f
     fi
 
-    # 3. Neutralize conflicting root forward zones in other files
+    # 3. Neutralize conflicting root forward zones in other files.
     local disabled_pairs=() f dst
-    for f in $(find_conflicting_files); do
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if [[ "$f" == "$MAIN_CONF" ]]; then
+            fail "root forward-zone lives in $MAIN_CONF itself: edit it manually, refusing to move the main config"
+            return 1
+        fi
         dst="${f}.disabled.unbound-manage.$(date +%Y%m%d-%H%M%S%N)"
         mv "$f" "$dst" 2>/dev/null || { fail "could not disable conflicting file $f"; return 1; }
         disabled_pairs+=("$dst:$f")
         warn "disabled conflicting zone file: $(basename "$f")"
-    done
+    done < <(find_conflicting_files)
 
     # 4. Apply atomically and activate
     if ! mv "$tmp" "$CONF_FILE" 2>/dev/null; then
         fail "could not write $CONF_FILE"
+        local pair d o
+        for pair in "${disabled_pairs[@]:-}"; do
+            d="${pair%%:*}"; o="${pair#*:}"
+            [[ -f "$d" ]] || continue
+            mv "$d" "$o" 2>/dev/null || true
+        done
         return 1
     fi
     TMP_CONF=""
     ok "config written: $CONF_FILE"
 
-    # Full config check before touching the daemon.
+    # 4b. Full config check BEFORE touching the daemon.
     if ! run_q "$UNBOUND_CHECKCONF_BIN" "$MAIN_CONF"; then
         fail "unbound-checkconf rejected the full configuration:"
         "$UNBOUND_CHECKCONF_BIN" "$MAIN_CONF" 2>&1 | head -5
-        warn "unbound was NOT reloaded - it still serves the previous config in memory."
-        warn "NOTE: on the next reload/restart/reboot the invalid config would break it:"
-        manual_restore_hint "$MODE" "$backup" "${disabled_pairs[@]}"
+        local pair d o
+        for pair in "${disabled_pairs[@]:-}"; do
+            d="${pair%%:*}"; o="${pair#*:}"
+            [[ -f "$d" ]] || continue
+            if mv "$d" "$o" 2>/dev/null; then
+                ok "re-enabled sibling: $(basename "$o")"
+            fi
+        done
+        if [[ -n "$backup" && -f "$backup" ]]; then
+            cp -a "$backup" "$CONF_FILE" 2>/dev/null || rm -f "$CONF_FILE"
+            ok "reverted $CONF_FILE from backup"
+        else
+            rm -f "$CONF_FILE"
+            info "removed just-written $CONF_FILE (no prior backup)"
+        fi
+        info "unbound was NOT reloaded - still serves previous config in memory."
         return 1
     fi
     ok "unbound-checkconf: full config valid"
