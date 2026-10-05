@@ -13,6 +13,16 @@ File `configs/etc/nftables.conf` at `/etc/nftables.conf`.
 - Drop UDP and TCP to port 53 unless destination is loopback.
 - IPv4 loopback `127.0.0.0/8` keeps Pi-hole to Unbound on `127.0.0.1:5335`.
 - IPv6 loopback `::1` for the same local path.
+- MagicDNS exception: accept UDP/TCP to `100.100.100.100:53`, the resolver
+  running inside `tailscaled` on this host. It is a local resolver, not an
+  external one, so it is not a DNS leak. It is scoped by destination and
+  deliberately **without** `skuid`, so it does not interfere with
+  `unbound-manage`'s recursive-mode exemption detection (which matches any
+  `skuid <unbound>` + `dport 53` + `accept` rule) nor with the installer's
+  live-rule whitelist. Public names cannot bypass Pi-hole through it:
+  `tailscaled` forwards non-tailnet queries to the global nameserver (this
+  host, port 53), which remains dropped for every uid except unbound's in
+  recursive mode.
 - `destroy table inet filter` before rebuild keeps reload idempotent.
 - Recursive mode adds temporary `skuid unbound it (eg. 102)` accepts above drops, removed when returning to DoT mode.
 

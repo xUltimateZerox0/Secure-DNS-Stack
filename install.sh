@@ -4,7 +4,8 @@
 # automation uses --yes. Nothing changes with --dry-run.
 #
 # Order: preflight -> backup -> packages -> resolver lock -> nftables ->
-# unbound -> pihole (incl. managed keys) -> unbound-manage -> ufw -> verify.
+# unbound -> tailnet (MagicDNS forward) -> pihole (incl. managed keys) ->
+# unbound-manage -> ufw -> verify.
 # Each phase verifies before the next starts. On failure the script stops
 # and prints restore paths; only a file that fails validation is reverted
 # before any daemon reload, services themselves are never auto-rolled back.
@@ -312,7 +313,7 @@ phase_packages() {
     dig_pkg=$(first_available bind9-dnsutils dnsutils) \
         || { log "No dig package found."; return 1; }
     install_packages unbound dns-root-data nftables ca-certificates \
-        curl sqlite3 iproute2 git "$dig_pkg"
+        curl sqlite3 iproute2 git jq "$dig_pkg"
     mem_profile
 }
 phase_resolver() {
@@ -390,7 +391,7 @@ phase_nftables() {
         live=$(nft list table inet filter 2>/dev/null || true)
         if [[ -n "$live" ]]; then
             rest=$(echo "$live" | tr ';{}' '\n\n\n' \
-                | grep -vE "table inet filter|chain output|type filter hook output|policy (accept|drop)|dport 53 (ip|ip6)? ?daddr.*drop|meta skuid.*dport 53 accept|^[[:space:]]*$" || true)
+                | grep -vE "table inet filter|chain output|type filter hook output|policy (accept|drop)|dport 53 (ip|ip6)? ?daddr.*drop|meta skuid.*dport 53 accept|(ip daddr 100\.100\.100\.100 (udp|tcp) dport 53 accept|(udp|tcp) dport 53 ip daddr 100\.100\.100\.100 accept)|^[[:space:]]*$" || true)
             if [[ -n "$rest" ]]; then
                 log "Foreign live rules in table inet filter:"
                 echo "$rest" | head -5
@@ -677,6 +678,88 @@ phase_unbound() {
     [[ -n "$r" ]] || { log "unbound :5335 does not resolve."; return 1; }
     log "unbound :5335 resolves -> $r"
 }
+
+# --- Tailnet MagicDNS: generated per-tailnet, never committed ---
+# The tailnet DNS name (e.g. tail1234.ts.net) is different for every user,
+# so the forward zone cannot live in the repo: it is rendered here from the
+# local tailscaled state and re-rendered on every run.
+# 100.100.100.100 is the resolver inside tailscaled: it answers tailnet
+# names authoritatively (also with --accept-dns=false) without forwarding
+# them out, so no loop is possible. The tailnet zone is absent from public
+# DNS and ts.net has no DS record, hence domain-insecure + a dedicated
+# forward-zone that wins over the "." Quad9 zone. Verified per-tailnet
+# behavior and rationale: docs/debugging.md (2026-10-05 entry).
+phase_tailnet() {
+    log "Phase tailnet MagicDNS"
+    local dir="/etc/unbound/unbound.conf.d"
+    local dst="${dir}/99-tailscale-magicdns.conf"
+    local suffix=""
+
+    if ! command -v tailscale >/dev/null 2>&1; then
+        log "No tailscale binary: LAN-only, no MagicDNS forward."
+        return 0
+    fi
+    if ! tailscale status >/dev/null 2>&1; then
+        log "Tailscale not logged in: MagicDNS forward skipped."
+        log "Join later, then re-run this installer to add it."
+        return 0
+    fi
+    # Official source: tailscale dns status --json (v1.96+) and
+    # tailscale status --json both expose CurrentTailnet.MagicDNSSuffix.
+    if command -v jq >/dev/null 2>&1; then
+        suffix=$(tailscale dns status --json 2>/dev/null \
+            | jq -r '.CurrentTailnet.MagicDNSSuffix // empty' 2>/dev/null || true)
+        [[ -n "$suffix" ]] || suffix=$(tailscale status --json 2>/dev/null \
+            | jq -r '.CurrentTailnet.MagicDNSSuffix // empty' 2>/dev/null || true)
+    fi
+    if [[ -z "$suffix" ]]; then
+        log "MagicDNS suffix not detected (daemon not ready, or jq missing)."
+        log "Re-run after 'tailscale up' to install the forward zone."
+        return 0
+    fi
+    # Defense in depth: accept only a plain lowercase DNS name inside ts.net.
+    if [[ ! "$suffix" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.ts\.net$ ]]; then
+        log "Unexpected MagicDNS suffix '$suffix': refusing to render."
+        return 1
+    fi
+    if (( DRY_RUN )); then
+        log "DRY-RUN deploy: rendered ${suffix} forward -> $dst"
+        return 0
+    fi
+    mutate mkdir -p "$dir"
+    local tmp
+    tmp=$(mktemp "${dir}/.tailnet.XXXXXX") || return 1
+    cat > "$tmp" << EOF
+# Managed by secure-dns-stack installer (regenerated on every run).
+# Tailnet zone detected from tailscaled: ${suffix}
+# Do not commit: the tailnet name is per-user.
+server:
+    # ts.net has no DS record: the zone is insecure, no chain to validate.
+    domain-insecure: "${suffix}."
+forward-zone:
+    name: "${suffix}."
+    forward-addr: 100.100.100.100
+EOF
+    chmod 644 "$tmp"
+    if cmp -s "$tmp" "$dst" 2>/dev/null; then
+        log "Unchanged: $dst (${suffix})"
+        rm -f "$tmp"
+        return 0
+    fi
+    backup_path "$dst"
+    mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+    log "Deployed: $dst (${suffix} -> 100.100.100.100)"
+    unbound-checkconf /etc/unbound/unbound.conf >/dev/null 2>&1 \
+        || { log "unbound-checkconf rejected the rendered forward."; return 1; }
+    log "unbound-checkconf: full config valid"
+    if systemctl is-active --quiet unbound 2>/dev/null; then
+        mutate systemctl reload unbound
+    else
+        mutate systemctl start unbound
+    fi
+    log "MagicDNS: tailnet names under ${suffix} resolve via Pi-hole"
+}
+
 # Fresh Pi-hole via the official installer, network identity detected
 # from the live system and confirmed, never guessed or changed.
 install_pihole_fresh() {
@@ -873,6 +956,23 @@ phase_verify() {
         log "DRY-RUN: live status check skipped."
         return 0
     fi
+    # Optional tailnet acceptance check. Tailscale is not part of this repo:
+    # a LAN-only host stays silent, and a failure here is informational and
+    # never stops the install (the LAN stack is complete without it).
+    local magic_file="/etc/unbound/unbound.conf.d/99-tailscale-magicdns.conf"
+    if [[ -f "$magic_file" ]] && command -v tailscale >/dev/null 2>&1 \
+        && command -v jq >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+        local self_fqdn ans
+        self_fqdn=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' 2>/dev/null || true)
+        if [[ -n "$self_fqdn" ]]; then
+            ans=$(dig +short +timeout=3 "@127.0.0.1" "${self_fqdn%.}" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+            if [[ -n "$ans" ]]; then
+                log "MagicDNS acceptance: ${self_fqdn%.} -> $ans"
+            else
+                log "MagicDNS acceptance: ${self_fqdn%.} did not resolve (informational; tailnet is optional)."
+            fi
+        fi
+    fi
     if [[ -x /usr/local/bin/unbound-manage ]]; then
         /usr/local/bin/unbound-manage status
         return $?
@@ -906,6 +1006,7 @@ main() {
     phase_resolver || { print_rollback; exit 1; }
     phase_nftables || { print_rollback; exit 1; }
     phase_unbound || { print_rollback; exit 1; }
+    phase_tailnet || { print_rollback; exit 1; }
     phase_pihole || { print_rollback; exit 1; }
     phase_manager || { print_rollback; exit 1; }
     phase_ufw || { print_rollback; exit 1; }

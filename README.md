@@ -33,6 +33,7 @@ Unlike standard Docker deployments, this stack is built directly on bare-metal t
 
 *   **DNS Sinkhole & Resolver** - Pi-hole handles aggressive ad-blocking and telemetry filtering, forwarding allowed queries to a hardened local Unbound daemon.
 *   **Dynamic Resolution Modes** - A custom CLI tool allows atomic switching between **DNS-over-TLS (Quad9)** for query encryption, or **Iterative Root Resolution** for direct recursive querying.
+*   **MagicDNS resolution for every client** - Unbound forwards the tailnet zone to `100.100.100.100`, the resolver inside `tailscaled`, so Pi-hole clients resolve Tailscale names without pointing their own resolver (which adds a hop and hits known Tailscale DNS stalls). The forward zone is **generated at install time** from the detected tailnet name (`tailscale dns status --json` / `tailscale status --json`, field `CurrentTailnet.MagicDNSSuffix`) because the tailnet DNS name is different for every user: nothing per-tailnet is committed. The DNS-leak firewall accepts `100.100.100.100:53` by destination, without weakening the recursive-mode `skuid` exemption logic.
 *   **Kernel-Level Leak Prevention** - An `nftables` firewall drops all outbound cleartext DNS traffic (port 53, UDP and TCP), featuring a `skuid` (Socket UID) exemption exclusively for the Unbound process. 
 *   **Secure Remote Access** - Bound directly to Tailscale interfaces, allowing encrypted DNS resolution from any authorized remote device without exposing ports to the public internet.
 
@@ -67,7 +68,7 @@ Runs ONLY on the Pi-hole + Unbound server (auto-guarded). Full reference: `unbou
 | `dot [--persistent]` | Switch Unbound to DoT forwarding → Quad9 only (removes non-Quad9 upstreams, DNSSEC stays on) | ~3-5s |
 | `recursive [--persistent]` | Switch to full recursion (root hints + anchor + qname minimisation, no forwarders) | ~3-5s |
 | `default [dot\|recursive\|clear\|show]` | Save boot default mode, like `--persistent` but without switching. | instant |
-| `status` | Full diagnostic (mode, services, Tailscale, listeners, connectivity, resolv.conf, upstream, resolution, blocking, DNSSEC, DoT activity, firewall) | ~5-8s |
+| `status` | Full diagnostic (mode, services, Tailscale, MagicDNS forward, listeners, connectivity, resolv.conf, upstream, resolution, blocking, DNSSEC, DoT activity, firewall) | ~5-8s |
 | `fix-resolv` | Point /etc/resolv.conf to 127.0.0.1 (Pi-hole) | ~1-2s |
 | `--debug` | First-or-last-argument flag showing every command + raw output | — |
 
@@ -99,6 +100,8 @@ $ sudo unbound-manage status
  ✔ this node: 100.111.xxx.xxx
  ✔ interface reachable (tailscale0)
  ✔ peers: 3
+ ✔ MagicDNS forward: tail1234.ts.net -> 100.100.100.100
+ ✔ MagicDNS name resolves: station.tail1234.ts.net
 
 ━━━ Listeners ━━━
  ✔ port 53: listening (Pi-hole)
@@ -157,12 +160,13 @@ The repository includes a deployment script (`install.sh`) that converges a Debi
 
 **What the script does:**
 1.  Preflight checks (root, systemd, OS family, free disk, port holders) with `--dry-run` available.
-2.  Installs core dependencies (`unbound`, `nftables`, `dns-root-data`, `bind9-dnsutils`, `ca-certificates`, `curl`, `sqlite3`, `iproute2`, `git`).
+2.  Installs core dependencies (`unbound`, `nftables`, `dns-root-data`, `bind9-dnsutils`, `ca-certificates`, `curl`, `sqlite3`, `iproute2`, `git`, `jq`).
 3.  Disables `systemd-resolved`/`resolvconf` stubs when present and locks `/etc/resolv.conf` to `127.0.0.1`, shielded from NetworkManager.
 4.  Deploys the `nftables` leak-prevention ruleset without touching other tables, plus Unbound base tuned to installed RAM.
 5.  Installs Pi-hole with the official installer when missing (network identity detected, confirmed, never changed), then enforces upstream `127.0.0.1#5335`, HTTPS-only admin and blocklists on any install.
 6.  Installs `unbound-manage` in `/usr/local/bin` and enables the boot restore service, then adds UFW DNS allows only.
-7.  Verifies everything with `unbound-manage status`.
+7.  Renders the per-tailnet MagicDNS forward for Unbound (detected from the local `tailscaled`; skipped with a clear message when the tailnet is not joined yet) and validates it with `unbound-checkconf` before reloading.
+8.  Verifies everything with `unbound-manage status`.
 
 ### Quick Start
 
@@ -189,6 +193,7 @@ sudo unbound-manage status
 > **IMPORTANT**
 > *   Set the web password yourself with `pihole setpassword` — the installer never touches personal credentials/secrets.
 > *   On DHCP networks reserve a static address for the server on the router, otherwise clients pointing at it lose DNS when the lease changes.
+> *   Joined the tailnet after installing (or renamed the tailnet)? Re-run `sudo ./install.sh`: the MagicDNS forward zone is regenerated from the current tailnet name. The stack converges and only the changed file is touched.
 
 ## License
 
