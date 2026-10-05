@@ -4,8 +4,7 @@
 # automation uses --yes. Nothing changes with --dry-run.
 #
 # Order: preflight -> backup -> packages -> resolver lock -> nftables ->
-# unbound -> tailnet (MagicDNS forward) -> pihole (incl. managed keys) ->
-# unbound-manage -> ufw -> verify.
+# unbound -> pihole (incl. managed keys) -> unbound-manage -> ufw -> verify.
 # Each phase verifies before the next starts. On failure the script stops
 # and prints restore paths; only a file that fails validation is reverted
 # before any daemon reload, services themselves are never auto-rolled back.
@@ -679,7 +678,7 @@ phase_unbound() {
     log "unbound :5335 resolves -> $r"
 }
 
-# --- Tailnet MagicDNS: generated per-tailnet, never committed ---
+# --- Tailnet MagicDNS: generated per-tailnet ---
 # The tailnet DNS name (e.g. tail1234.ts.net) is different for every user,
 # so the forward zone cannot live in the repo: it is rendered here from the
 # local tailscaled state and re-rendered on every run.
@@ -757,7 +756,7 @@ EOF
     else
         mutate systemctl start unbound
     fi
-    log "MagicDNS: tailnet names under ${suffix} resolve via Pi-hole"
+    log "MagicDNS: tails names under ${suffix} resolve via Pi-hole"
 }
 
 # Fresh Pi-hole via the official installer, network identity detected
